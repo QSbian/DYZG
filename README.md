@@ -1,6 +1,4 @@
-# DYZG - 科学计算器课程项目
-
-三人协作课程项目，围绕科学计算器展开，从命令行逐步演进到多平台 GUI。
+# DYZG 
 
 ## 项目成员
 
@@ -42,10 +40,3 @@ python 202321101133/任务二/calculator.py   # 交互式 REPL 模式
 pip install PySide6>=6.5.0
 python 202321101063/任务三/calculator_gui.py
 ```
-
-## 相关链接
-
-- [GitHub 仓库](https://github.com/QSbian/DYZG)
-- [PySide6 官方文档](https://doc.qt.io/qtforpython-6/)
-- [Qt C++ 官方文档](https://doc.qt.io/qt-6/)
-- [Vue 3 官方文档](https://cn.vuejs.org/)

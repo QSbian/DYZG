@@ -25,8 +25,11 @@ import pandas as pd
 
 # Windows 终端 UTF-8 修复
 if sys.platform == 'win32':
-    sys.stdout.reconfigure(encoding='utf-8')
-    sys.stderr.reconfigure(encoding='utf-8')
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8')
+    except AttributeError:
+        pass
 
 warnings.filterwarnings('ignore', category=FutureWarning)
 

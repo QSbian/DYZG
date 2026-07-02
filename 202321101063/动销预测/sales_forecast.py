@@ -18,6 +18,7 @@ v2 改动：
 
 import os
 import sys
+import re
 import sqlite3
 import csv
 import json
@@ -121,6 +122,7 @@ class DataLoader:
 #  预测算法模块
 # ============================================================
 
+# ---------- 基类定义 ----------
 class BasePredictor:
     """预测器基类"""
     name = "Base"
@@ -129,6 +131,7 @@ class BasePredictor:
         raise NotImplementedError
 
 
+# ---------- 朴素预测算法 ----------
 class NaivePredictor(BasePredictor):
     """朴素预测：用最后一个观测值作为所有未来期的预测值"""
     name = "Naive"
@@ -152,6 +155,7 @@ class NaivePredictor(BasePredictor):
         return max(0.0, min(100.0, 100.0 * (1 - mape)))
 
 
+# ---------- 简单移动平均（SMA）算法 ----------
 class SMAPredictor(BasePredictor):
     """简单移动平均（SMA）"""
     name = "SMA"
@@ -177,6 +181,7 @@ class SMAPredictor(BasePredictor):
         return max(0.0, min(100.0, 100.0 * (1 - mape)))
 
 
+# ---------- 中位数预测算法 ----------
 class MedianPredictor(BasePredictor):
     """中位数预测"""
     name = "Median"
@@ -200,6 +205,7 @@ class MedianPredictor(BasePredictor):
         return max(0.0, min(100.0, 100.0 * (1 - mape)))
 
 
+# ---------- Holt-Winters 指数平滑算法 ----------
 class HWPredictor(BasePredictor):
     """Holt-Winters 指数平滑"""
     name = "HW"
@@ -231,6 +237,7 @@ class HWPredictor(BasePredictor):
             return SMAPredictor().fit_predict(series, forecast_horizon)
 
 
+# ---------- 随机森林（Random Forest）算法 ----------
 class RFPredictor(BasePredictor):
     """随机森林回归预测"""
     name = "RF"
@@ -276,6 +283,7 @@ class RFPredictor(BasePredictor):
         return np.maximum(0, forecast), accuracy
 
 
+# ---------- Croston 稀疏序列预测算法 ----------
 class CrostonPredictor(BasePredictor):
     """Croston 方法——适合间歇性需求序列"""
     name = "Croston"
@@ -321,7 +329,7 @@ class CrostonPredictor(BasePredictor):
 
 
 # ============================================================
-#  预测引擎
+#  预测引擎模块（算法调度 + 回溯验证 + 结果生成）
 # ============================================================
 
 class ForecastEngine:
@@ -336,6 +344,105 @@ class ForecastEngine:
         NaivePredictor(),
     ]
 
+    # =========================================================
+    #  回溯验证与序列特征分析（新增）
+    # =========================================================
+
+    @staticmethod
+    def smape(actual: np.ndarray, predicted: np.ndarray) -> float:
+        """计算 sMAPE（对称平均百分比误差），返回值 ∈ [0, 200]"""
+        actual = np.array(actual, dtype=float).flatten()
+        predicted = np.array(predicted, dtype=float).flatten()
+        denom = (np.abs(actual) + np.abs(predicted)) / 2.0
+        return float(np.mean(np.abs(actual - predicted) / (denom + 1e-9))) * 100
+
+    @staticmethod
+    def backtest(predictor, series: np.ndarray, test_horizon: int = 3) -> float:
+        """回溯验证：用扩展窗口法评估预测器，返回 sMAPE（越低越好）。
+
+        做法：
+          1. 保留最后 test_horizon 期作为测试集
+          2. 用前面所有数据训练，预测测试集
+          3. 用 sMAPE 比较预测值与真实值
+        """
+        n = len(series)
+        if n <= test_horizon + 3:
+            return 50.0  # 数据太少，给中等分数
+
+        train = series[:-test_horizon]
+        test = series[-test_horizon:]
+
+        try:
+            forecast, _ = predictor.fit_predict(train, test_horizon)
+            smape_val = ForecastEngine.smape(test, forecast)
+            return smape_val
+        except Exception:
+            return 100.0  # 预测失败，给最差分数
+
+    @staticmethod
+    def characterize_series(series: np.ndarray) -> Dict[str, float]:
+        """分析时间序列特征，返回特征字典。"""
+        s = np.array(series, dtype=float).flatten()
+        n = len(s)
+        nonzero = s[s > 0]
+        nz_len = len(nonzero)
+
+        # 稀疏度：0值占比（越高 = 间歇性越强）
+        sparsity = float(np.sum(s == 0)) / max(n, 1)
+
+        # 趋势强度：用首尾各1/3数据比较（忽略全0）
+        trend_strength = 0.0
+        if n >= 6:
+            head = np.mean(s[:max(1, n // 3)])
+            tail = np.mean(s[-max(1, n // 3):])
+            if head > 0:
+                trend_strength = (tail - head) / head
+            elif tail > 0:
+                trend_strength = 1.0
+
+        # 变异系数：稳定性（越低 = 越稳定）
+        cv = float(np.std(nonzero) / (np.mean(nonzero) + 1e-9)) if nz_len > 1 else 1.0
+
+        # 数据量
+        n_points = n
+
+        return {
+            'sparsity': sparsity,
+            'trend_strength': trend_strength,
+            'cv': cv,
+            'n_points': n_points,
+            'n_nonzero': nz_len,
+        }
+
+    @staticmethod
+    def preselect_predictors(series: np.ndarray) -> List[BasePredictor]:
+        """根据序列特征预选候选算法，减少不必要的回溯验证。"""
+        feats = ForecastEngine.characterize_series(series)
+        candidates = list(ForecastEngine.PREDICTORS)
+
+        # 高度稀疏（>50% 为0）→ 优先 Croston，禁用 RF（数据太少）
+        if feats['sparsity'] > 0.5:
+            candidates = [p for p in candidates if p.name in ('Croston', 'Naive', 'Median')]
+            return candidates
+
+        # 强趋势（增长 >50% 或下降 >30%）→ 优先 HW / RF
+        if abs(feats['trend_strength']) > 0.5 and feats['n_points'] >= 8:
+            # 保留 HW、RF、SMA，禁用 Naive（趋势下 Naive 最差）
+            candidates = [p for p in candidates if p.name not in ('Naive', 'Median')]
+
+        # 非常稳定（CV < 0.3）→ 优先 SMA / Median
+        if feats['cv'] < 0.3 and feats['n_nonzero'] >= 4:
+            candidates = [p for p in candidates if p.name in ('SMA', 'Median', 'Naive', 'Croston')]
+
+        return candidates if candidates else list(ForecastEngine.PREDICTORS)
+
+    # =========================================================
+    #  核心方法：数据加载 / 预测执行 / 耗时估算
+    # =========================================================
+
+    # =========================================================
+    #  维度定义（三种预测粒度）
+    # =========================================================
     DIMENSIONS = {
         'model': {
             'groupby': ['channel', 'category', 'subcategory', 'model'],
@@ -397,6 +504,9 @@ class ForecastEngine:
             df = df[df['model'].str.contains(filter_model, na=False)]
 
         # ---- 构建时间序列透视表 ----
+        if df.empty:
+            return pd.DataFrame()
+
         pivot = df.pivot_table(
             index=groupby_cols,
             columns='period',
@@ -405,6 +515,8 @@ class ForecastEngine:
             fill_value=0,
         )
         all_periods = sorted(df['period'].unique())
+        if not all_periods:
+            return pd.DataFrame()
         for p in all_periods:
             if p not in pivot.columns:
                 pivot[p] = 0
@@ -473,7 +585,10 @@ class ForecastEngine:
 
         # 添加合计行
         total_row = OrderedDict([('渠道', ''), ('型号', ''), ('细分类', ''), ('预测算法', ''), ('准确率', '')])
-        numeric_cols = [c for c in result_df.columns if c not in ['渠道', '型号', '细分类', '预测算法', '准确率']]
+        # 只对纯数值列做合计（排除含字符串的列如准确率、数据状态等）
+        numeric_cols = [c for c in result_df.columns
+                        if c not in ('渠道', '型号', '细分类', '预测算法', '准确率', '数据状态')
+                        and result_df[c].dtype.kind in 'iuf']
         for col in numeric_cols:
             total_row[col] = int(result_df[col].sum()) if result_df[col].dtype.kind in 'iuf' else round(result_df[col].sum(), 1)
         total_df = pd.DataFrame([total_row])
@@ -529,30 +644,76 @@ class ForecastEngine:
         return round(max(2.0, min(estimated, 120.0)), 1)
 
     def _predict_one_group(self, idx, series_values, predictors, forecast_months, pivot, target_periods):
-        """对单个分组执行预测（可被并行调用）"""
-        best_algo_name = 'SMA'
-        best_forecast = None
-        best_acc = 0.0
+        """对单个分组执行预测（用回溯验证选最优算法）
+        
+        数据充足度判断：
+        - 充足：历史数据 ≥ 12 个月且非零值 ≥ 6
+        - 一般：历史数据 ≥ 6 个月且非零值 ≥ 3
+        - 不足：历史数据 < 6 个月或非零值 < 3
+        - 严重不足：历史数据 < 3 个月或全为 0
+        """
+        n_total = len(series_values)
+        n_nonzero = int(np.sum(series_values > 0))
+        last_nonzero = max(1, n_total - int(np.argmax(series_values[::-1] > 0))) if n_nonzero > 0 else 0
 
-        for predictor in predictors:
-            try:
-                forecast_arr, acc = predictor.fit_predict(series_values, forecast_months)
-                if acc > best_acc:
-                    best_acc = acc
-                    best_forecast = forecast_arr
-                    best_algo_name = predictor.name
-            except Exception:
-                continue
+        # ---- 数据状态评估 ----
+        if n_total < 3 or n_nonzero == 0:
+            data_status = '严重不足'
+            best_acc = None  # 标记为数据不足，表格中显示"数据不足"
+        elif n_total < 6 or n_nonzero < 3:
+            data_status = '不足'
+            best_acc = None
+        elif n_total >= 12 and n_nonzero >= 6:
+            data_status = '充足'
+        else:
+            data_status = '一般'
 
-        if best_forecast is None:
-            return None
+        # ---- 第一步：回溯验证，选 sMAPE 最低的算法 ----
+        # 数据不足时跳过回溯验证，直接用朴素预测
+        if data_status in ('严重不足', '不足'):
+            best_predictor = predictors[0] if predictors else NaivePredictor()
+            best_smape = 80.0  # 默认较低准确率
+        else:
+            test_h = max(2, min(4, n_total // 4))
+            test_h = min(test_h, forecast_months)
 
+            best_smape = float('inf')
+            best_predictor = None
+
+            for predictor in predictors:
+                try:
+                    smape_val = ForecastEngine.backtest(predictor, series_values, test_h)
+                    if smape_val < best_smape:
+                        best_smape = smape_val
+                        best_predictor = predictor
+                except Exception:
+                    continue
+
+            if best_predictor is None:
+                best_predictor = predictors[0] if predictors else NaivePredictor()
+                best_smape = 50.0
+
+        # ---- 第二步：用最优算法做正式预测 ----
+        try:
+            best_forecast, _ = best_predictor.fit_predict(series_values, forecast_months)
+        except Exception:
+            best_forecast = np.zeros(forecast_months)
+
+        best_algo_name = best_predictor.name
+        # 准确率：数据不足时设为 None（表格中显示"数据不足"）
+        if data_status in ('严重不足', '不足'):
+            best_acc = None
+        else:
+            best_acc = max(0.0, min(100.0, 100.0 - best_smape))
+
+        # ---- 第三步：构建结果行 ----
         result_row = OrderedDict([
             ('渠道', idx[0]),
             ('型号', idx[3] if len(idx) > 3 else ''),
             ('细分类', idx[2] if len(idx) > 2 else ''),
             ('预测算法', best_algo_name),
-            ('准确率', round(best_acc, 2)),
+            ('准确率', round(best_acc, 2) if best_acc is not None else '数据不足'),
+            ('数据状态', data_status),
         ])
 
         hist_cols = list(pivot.columns)[-forecast_months:] if len(pivot.columns) >= forecast_months else list(pivot.columns)
@@ -589,7 +750,7 @@ try:
         QGridLayout, QPushButton, QLineEdit, QLabel, QComboBox,
         QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox,
         QSplitter, QGroupBox, QListWidget, QListWidgetItem, QProgressBar, QFileDialog,
-        QCheckBox, QSpinBox, QDialog, QDialogButtonBox, QAbstractItemView,
+        QCheckBox, QSpinBox, QDialog, QDialogButtonBox, QAbstractItemView, QFrame,
         QSizePolicy, QButtonGroup, QRadioButton, QCompleter,
     )
     from PySide6.QtCore import Qt, QTimer, Signal, QThread, QObject, QPropertyAnimation, QEasingCurve
@@ -599,110 +760,155 @@ except ImportError as _e:
     HAS_PYSIDE6 = False
 
 
+# ============================================================
+#  全局样式表（左暗右亮分体主题）
+#  左侧导航栏保持暗色主题，右侧内容区为浅色主题
+# ============================================================
 TABLE_STYLESHEET = """
+/* ---- 全局默认（暗色底，nav 依赖此默认值） ---- */
 QMainWindow { background-color: #1e1e2e; }
-QWidget { background-color: #1e1e2e; color: #cdd6f4; font-family: "Microsoft YaHei", sans-serif; font-size: 13px; }
+QWidget { color: #333333; font-family: "Microsoft YaHei", sans-serif; font-size: 13px; }
 
 QLabel#title_label { color: #89b4fa; font-size: 16px; font-weight: bold; padding: 8px; }
-QLabel#section_label { color: #a6adc8; font-size: 14px; font-weight: bold; padding: 4px 8px 2px; border-bottom: 1px solid #45475a; margin-top: 4px; }
-QLabel#dim_title { color: #cba6f7; font-size: 18px; font-weight: bold; padding: 8px 12px; }
 
-QTableWidget {
-    background-color: #181825;
-    color: #cdd6f4;
-    gridline-color: #313244;
-    border: 1px solid #45475a;
-    border-radius: 6px;
-    selection-background-color: #45475a;
-}
-QTableWidget::item { padding: 4px 8px; }
-QTableWidget::item:selected { color: #89b4fa; background-color: #45475a; }
-QHeaderView::section {
-    background-color: #313244;
-    color: #bac2de;
-    padding: 6px 10px;
-    border: none;
-    border-right: 1px solid #45475a;
-    border-bottom: 1px solid #45475a;
-    font-weight: bold;
-}
-
-QPushButton#btn_primary {
-    background-color: #89b4fa; color: #1e1e2e; border: none; border-radius: 4px;
-    padding: 6px 16px; font-weight: bold; min-height: 28px;
-}
-QPushButton#btn_primary:hover { background-color: #74c7ec; }
-QPushButton#btn_primary:checked, QPushButton#btn_primary:pressed { background-color: #b4befe; }
-QPushButton#btn_success {
-    background-color: #a6e3a1; color: #1e1e2e; border: none; border-radius: 4px;
-    padding: 6px 16px; font-weight: bold; min-height: 28px;
-}
-QPushButton#btn_success:hover { background-color: #94e2d5; }
-QPushButton#btn_warning {
-    background-color: #f9e2af; color: #1e1e2e; border: none; border-radius: 4px;
-    padding: 6px 16px; font-weight: bold; min-height: 28px;
-}
-QPushButton#btn_warning:hover { background-color: #f5c2e7; }
-QPushButton#btn_danger {
-    background-color: #f38ba8; color: #1e1e2e; border: none; border-radius: 4px;
-    padding: 6px 16px; font-weight: bold; min-height: 28px;
-}
-QPushButton#btn_danger:hover { background-color: #eba0ac; }
-QPushButton#btn_default {
-    background-color: #45475a; color: #cdd6f4; border: 1px solid #585b70; border-radius: 4px;
-    padding: 6px 16px; min-height: 28px;
-}
-QPushButton#btn_default:hover { background-color: #585b70; }
-
-/* 渠道按钮样式 */
-QPushButton#ch_btn {
-    background-color: #313244; color: #cdd6f4; border: 1px solid #585b70; border-radius: 4px;
-    padding: 6px 18px; font-weight: normal; min-height: 28px;
-}
-QPushButton#ch_btn:hover { background-color: #45475a; border-color: #89b4fa; }
-QPushButton#ch_btn:checked {
-    background-color: #89b4fa; color: #1e1e2e; border-color: #89b4fa; font-weight: bold;
-}
-
-QComboBox {
-    background-color: #181825; color: #cdd6f4; border: 1px solid #585b70;
-    border-radius: 4px; padding: 4px 8px; min-height: 26px;
-}
-QComboBox::drop-down { border: none; width: 20px; }
-QComboBox::down-arrow { image: none; border-left: 5px solid transparent; border-right: 5px solid transparent; border-top: 6px solid #a6adc8; margin-right: 6px; }
-QComboBox QAbstractItemView { background-color: #181825; color: #cdd6f4; selection-background-color: #45475a; }
-QComboBox:focus { border-color: #89b4fa; }
-QComboBox QAbstractItemView { max-height: 200px; }
-
-QLineEdit {
-    background-color: #181825; color: #cdd6f4; border: 1px solid #585b70;
-    border-radius: 4px; padding: 4px 8px; min-height: 22px;
-}
-QLineEdit:focus { border-color: #89b4fa; }
-
-/* 左侧导航栏 */
-QWidget#nav_panel { background-color: #181825; border-right: 1px solid #313244; }
+/* ---- 左侧导航栏（暗色主题保持） ---- */
+QWidget#nav_panel { background-color: #181825; }
+QWidget#nav_panel QLabel { color: #cdd6f4; }
+QWidget#nav_panel QLabel#title_label { color: #89b4fa; }
 QListWidget#nav_list {
     background-color: transparent; border: none; outline: none; font-size: 13px;
+    color: #a6adc8;
 }
 QListWidget#nav_list::item { padding: 10px 14px; border-radius: 6px; color: #a6adc8; margin: 2px 6px; }
 QListWidget#nav_list::item:hover { background-color: #313244; color: #cdd6f4; }
 QListWidget#nav_list::item:selected { background-color: #45475a; color: #89b4fa; font-weight: bold; border-left: 3px solid #89b4fa; }
 
-QStatusBar { color: #6c7086; font-size: 11px; }
-QProgressBar { border: 1px solid #45475a; border-radius: 3px; text-align: center; background-color: #181825; color: #a6adc8; height: 18px;}
-QProgressBar::chunk { background-color: #89b4fa; border-radius: 2px; }
+/* ---- 右侧内容区（浅色主题） ---- */
+QWidget#content_widget { background-color: #f8f9fa; }
+QWidget#content_widget QLabel { color: #333333; }
+QWidget#content_widget QLabel#dim_title { color: #5e4b8b; font-size: 18px; font-weight: bold; padding: 8px 12px; }
 
-QGroupBox {
-    border: 1px solid #45475a; border-radius: 6px; margin-top: 8px; padding-top: 16px;
-    font-weight: bold; color: #a6adc8;
+/* 内容区 - 表格 */
+QWidget#content_widget QTableWidget {
+    background-color: #ffffff;
+    color: #333333;
+    gridline-color: #e0e0e0;
+    border: 1px solid #cccccc;
+    border-radius: 6px;
+    selection-background-color: #cce5ff;
+    selection-color: #004085;
 }
-QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }
+QWidget#content_widget QTableWidget::item { padding: 4px 8px; }
+QWidget#content_widget QTableWidget::item:selected { color: #004085; background-color: #cce5ff; }
+QWidget#content_widget QHeaderView::section {
+    background-color: #e9ecef;
+    color: #495057;
+    padding: 6px 10px;
+    border: none;
+    border-right: 1px solid #dee2e6;
+    border-bottom: 2px solid #adb5bd;
+    font-weight: bold;
+}
 
-QSpinBox {
-    background-color: #181825; color: #cdd6f4; border: 1px solid #585b70;
+/* 内容区 - 按钮 */
+QWidget#content_widget QPushButton#btn_primary {
+    background-color: #0d6efd; color: #ffffff; border: none; border-radius: 4px;
+    padding: 6px 16px; font-weight: bold; min-height: 28px;
+}
+QWidget#content_widget QPushButton#btn_primary:hover { background-color: #0b5ed7; }
+QWidget#content_widget QPushButton#btn_primary:pressed { background-color: #0a58ca; }
+
+QWidget#content_widget QPushButton#btn_success {
+    background-color: #198754; color: #ffffff; border: none; border-radius: 4px;
+    padding: 6px 16px; font-weight: bold; min-height: 28px;
+}
+QWidget#content_widget QPushButton#btn_success:hover { background-color: #157347; }
+
+QWidget#content_widget QPushButton#btn_warning {
+    background-color: #ffc107; color: #212529; border: none; border-radius: 4px;
+    padding: 6px 16px; font-weight: bold; min-height: 28px;
+}
+QWidget#content_widget QPushButton#btn_warning:hover { background-color: #ffca2c; }
+
+QWidget#content_widget QPushButton#btn_danger {
+    background-color: #dc3545; color: #ffffff; border: none; border-radius: 4px;
+    padding: 6px 16px; font-weight: bold; min-height: 28px;
+}
+QWidget#content_widget QPushButton#btn_danger:hover { background-color: #bb2d3b; }
+
+QWidget#content_widget QPushButton#btn_default {
+    background-color: #6c757d; color: #ffffff; border: 1px solid #6c757d; border-radius: 4px;
+    padding: 6px 16px; min-height: 28px;
+}
+QWidget#content_widget QPushButton#btn_default:hover { background-color: #5c636a; }
+
+/* 内容区 - 渠道按钮 */
+QWidget#content_widget QPushButton#ch_btn {
+    background-color: #e9ecef; color: #495057; border: 1px solid #ced4da; border-radius: 4px;
+    padding: 6px 18px; font-weight: normal; min-height: 28px;
+}
+QWidget#content_widget QPushButton#ch_btn:hover { background-color: #dee2e6; border-color: #0d6efd; }
+QWidget#content_widget QPushButton#ch_btn:checked {
+    background-color: #0d6efd; color: #ffffff; border-color: #0d6efd; font-weight: bold;
+}
+
+/* 内容区 - QComboBox（浅色主题 + 消除黑框） */
+QWidget#content_widget QComboBox {
+    background-color: #ffffff; color: #333333;
+    border: 1px solid #ced4da;
+    border-radius: 4px; padding: 4px 8px; min-height: 26px;
+    outline: none;
+}
+QWidget#content_widget QComboBox:focus { border-color: #0d6efd; }
+QWidget#content_widget QComboBox:editable { background-color: #ffffff; }
+QWidget#content_widget QComboBox::drop-down { border: none; width: 22px; background: transparent; }
+QWidget#content_widget QComboBox::down-arrow {
+    image: url(arrow_down.png);
+    width: 14px; height: 14px;
+}
+/* 下拉列表弹窗 —— 消除原生黑框的关键规则 */
+QWidget#content_widget QComboBox QAbstractItemView {
+    background-color: #ffffff;
+    color: #333333;
+    selection-background-color: #cce5ff;
+    selection-color: #004085;
+    border: 1px solid #ced4da;
+    border-radius: 4px;
+    outline: none;
+    padding: 2px 0px;
+}
+QWidget#content_widget QComboBox QAbstractItemView::item { padding: 5px 10px; }
+QWidget#content_widget QComboBox QAbstractItemView::item:selected { background-color: #cce5ff; color: #004085; }
+QWidget#content_widget QComboBox QAbstractItemView::item:hover { background-color: #e9ecef; }
+QWidget#content_widget QComboBox QAbstractItemView { max-height: 200px; }
+
+/* 内容区 - QLineEdit */
+QWidget#content_widget QLineEdit {
+    background-color: #ffffff; color: #333333;
+    border: 1px solid #ced4da;
+    border-radius: 4px; padding: 4px 8px; min-height: 22px;
+}
+QWidget#content_widget QLineEdit:focus { border-color: #0d6efd; }
+
+/* 内容区 - QSpinBox */
+QWidget#content_widget QSpinBox {
+    background-color: #ffffff; color: #333333;
+    border: 1px solid #ced4da;
     border-radius: 4px; padding: 2px 6px; min-height: 24px;
 }
+
+/* 内容区 - QGroupBox */
+QWidget#content_widget QGroupBox {
+    border: 1px solid #dee2e6; border-radius: 6px; margin-top: 8px; padding-top: 16px;
+    font-weight: bold; color: #495057;
+    background-color: #ffffff;
+}
+QWidget#content_widget QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }
+
+/* ---- 全局 QStatusBar ---- */
+QStatusBar { color: #6c7086; font-size: 11px; background-color: #f0f0f0; }
+QProgressBar { border: 1px solid #ced4da; border-radius: 3px; text-align: center; background-color: #e9ecef; color: #495057; height: 18px; }
+QProgressBar::chunk { background-color: #0d6efd; border-radius: 2px; }
 """
 
 # ============================================================
@@ -960,7 +1166,9 @@ class ForecastWorker(QThread):
             import traceback
             self.error.emit(f"预测出错: {e}\n{traceback.format_exc()}")
 
-
+# ============================================================
+#  主窗口：动销预测系统 UI（左侧导航 + 筛选区 + 结果表格）
+# ============================================================
 class SalesForecastWindow(QMainWindow):
     """动销预测主窗口 v2"""
 
@@ -988,6 +1196,7 @@ class SalesForecastWindow(QMainWindow):
         self.setStyleSheet(TABLE_STYLESHEET)
 
         self._setup_ui()
+        self._fix_combo_popup_frames()
         self._load_initial_data()
 
     # ========== UI 搭建 ==========
@@ -1017,9 +1226,9 @@ class SalesForecastWindow(QMainWindow):
         self.nav_list.setObjectName("nav_list")
         nav_items = [
             ("\U0001f3e0 \u9996\u9875", "home"),
-            ("\U0001f4c8 \u6e20\u9053\u578b\u53f7\u52a8\u9500\u9884\u6d4a\u62a5\u8868", "model"),
-            ("\U0001f4ca \u6e20\u9053\u7ec6\u5206\u7c7b\u52a8\u9500\u9884\u6d4a\u62a5\u8868", "subcategory"),
-            ("\U0001f4cb \u6e20\u9053\u5927\u7c7b\u52a8\u9500\u9884\u6d4a\u62a5\u8868", "category"),
+            ("\U0001f4c8 \u6e20\u9053\u578b\u53f7\u51c6\u786e\u7387\u62a5\u8868", "model"),
+            ("\U0001f4ca \u6e20\u9053\u7ec6\u5206\u7c7b\u51c6\u786e\u7387\u62a5\u8868", "subcategory"),
+            ("\U0001f4cb \u6e20\u9053\u5927\u7c7b\u51c6\u786e\u7387\u62a5\u8868", "category"),
         ]
         for label, key in nav_items:
             item_text = f"  {label}"
@@ -1038,6 +1247,7 @@ class SalesForecastWindow(QMainWindow):
 
         # ===== 右侧内容区 =====
         content = QWidget()
+        content.setObjectName("content_widget")
         content_layout = QVBoxLayout(content)
         content_layout.setContentsMargins(16, 12, 16, 12)
         content_layout.setSpacing(10)
@@ -1102,46 +1312,39 @@ class SalesForecastWindow(QMainWindow):
             model_completer.setCaseSensitivity(Qt.CaseInsensitive)
         filter_layout.addWidget(self.combo_model, 1, 3, 1, 2)
 
-        # 第三行：预计月份（起始月 + 结束月）
-        filter_layout.addWidget(QLabel("\u9884\u8ba1\u6708\u4efd:"), 2, 0)
+        # 第三行：预测月份（起始月 ~ 结束月）
+        filter_layout.addWidget(QLabel("预测月份:"), 2, 0)
 
         month_widget = QWidget()
         month_layout = QHBoxLayout(month_widget)
         month_layout.setContentsMargins(0, 0, 0, 0)
         month_layout.setSpacing(6)
 
-        month_layout.addWidget(QLabel("\u8d77\u59cb"))
-        self.spin_month_start = QSpinBox()
-        self.spin_month_start.setRange(1, 36)
-        self.spin_month_start.setValue(1)
-        self.spin_month_start.setSuffix(" \u4e2a\u6708")
-        self.spin_month_start.setMinimumWidth(90)
-        month_layout.addWidget(self.spin_month_start)
-
-        month_layout.addWidget(QLabel("\u7ed3\u675f"))
-        self.spin_month_end = QSpinBox()
-        self.spin_month_end.setRange(1, 36)
-        self.spin_month_end.setValue(5)
-        self.spin_month_end.setSuffix(" \u4e2a\u6708")
-        self.spin_month_end.setMinimumWidth(90)
-        month_layout.addWidget(self.spin_month_end)
+        # 起始月份下拉框（可编辑）
+        self.combo_month_start = QComboBox()
+        self.combo_month_start.setEditable(True)
+        self.combo_month_start.setMinimumWidth(80)
+        self.combo_month_start.setMaximumWidth(100)
+        for m in range(1, 37):
+            self.combo_month_start.addItem(f"{m}月")
+        self.combo_month_start.setCurrentIndex(0)  # 默认1月
+        month_layout.addWidget(self.combo_month_start)
+        month_layout.addWidget(QLabel("~"))
+        # 结束月份下拉框（可编辑）
+        self.combo_month_end = QComboBox()
+        self.combo_month_end.setEditable(True)
+        self.combo_month_end.setMinimumWidth(80)
+        self.combo_month_end.setMaximumWidth(100)
+        for m in range(1, 37):
+            self.combo_month_end.addItem(f"{m}月")
+        self.combo_month_end.setCurrentIndex(4)  # 默认5月
+        month_layout.addWidget(self.combo_month_end)
 
         # 起止联动约束
-        self.spin_month_start.valueChanged.connect(self._on_month_start_changed)
-        self.spin_month_end.valueChanged.connect(self._on_month_end_changed)
+        self.combo_month_start.currentTextChanged.connect(self._on_month_start_changed)
+        self.combo_month_end.currentTextChanged.connect(self._on_month_end_changed)
 
         filter_layout.addWidget(month_widget, 2, 1, 1, 2)
-
-        # 快捷预设按钮
-        preset_layout = QHBoxLayout()
-        preset_layout.setSpacing(6)
-        for m in [1, 3, 6, 12]:
-            btn = QPushButton(f"{m}\u4e2a\u6708")
-            btn.setObjectName("btn_default")
-            btn.setFixedSize(56, 26)
-            btn.clicked.connect(lambda checked, v=m: self._set_month_preset(v))
-            preset_layout.addWidget(btn)
-        filter_layout.addLayout(preset_layout, 2, 3, 1, 2)
 
         # 第四行：操作按钮组
         btn_layout = QHBoxLayout()
@@ -1188,6 +1391,28 @@ class SalesForecastWindow(QMainWindow):
         # ===== 加载动画遮罩 =====
         self.loading_overlay = LoadingOverlay(self)
         self.loading_overlay.hide()
+
+    # ========== QComboBox 下拉弹窗去原生黑框 ==========
+    def _fix_combo_popup_frames(self):
+        """移除所有 QComboBox 下拉列表的原生 Windows 黑框"""
+        combos = [self.combo_category, self.combo_subcategory, self.combo_model,
+                  self.combo_month_start, self.combo_month_end]
+        for combo in combos:
+            view = combo.view()
+            if view:
+                view.setFrameShape(QFrame.NoFrame)
+                view.verticalScrollBar().setStyleSheet("""
+                    QScrollBar:vertical {
+                        background: #f0f0f0; width: 8px;
+                        border: none; border-radius: 4px;
+                    }
+                    QScrollBar::handle:vertical {
+                        background: #c0c0c0; border-radius: 4px; min-height: 20px;
+                    }
+                    QScrollBar::handle:vertical:hover { background: #a0a0a0; }
+                    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
+                    QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }
+                """)
 
     # ========== 初始数据加载 ==========
     def _load_initial_data(self):
@@ -1303,26 +1528,43 @@ class SalesForecastWindow(QMainWindow):
         pass  # QCompleter 已自动处理补全
 
     # ========== 月份区间处理 ==========
-    def _on_month_start_changed(self, value: int):
-        """起始月份变化时确保不超过结束月份"""
-        if value > self.spin_month_end.value():
-            self.spin_month_end.setValue(value)
+    def _get_month_value(self, combo) -> int:
+        """从月份下拉框安全读取值（支持手动输入）"""
+        text = combo.currentText().strip()
+        # 提取数字
+        m = re.search(r'(\d+)', text)
+        if m:
+            val = int(m.group(1))
+            return max(1, min(36, val))
+        return 1
 
-    def _on_month_end_changed(self, value: int):
+    def _on_month_start_changed(self, text: str):
+        """起始月份变化时确保不超过结束月份"""
+        start = self._get_month_value(self.combo_month_start)
+        end = self._get_month_value(self.combo_month_end)
+        if start > end:
+            # 设置结束月份为相同值
+            idx = max(0, min(35, start - 1))
+            self.combo_month_end.blockSignals(True)
+            self.combo_month_end.setCurrentIndex(idx)
+            self.combo_month_end.blockSignals(False)
+
+    def _on_month_end_changed(self, text: str):
         """结束月份变化时确保不小于起始月份"""
-        if value < self.spin_month_start.value():
-            self.spin_month_start.setValue(value)
+        start = self._get_month_value(self.combo_month_start)
+        end = self._get_month_value(self.combo_month_end)
+        if end < start:
+            idx = max(0, min(35, end - 1))
+            self.combo_month_start.blockSignals(True)
+            self.combo_month_start.setCurrentIndex(idx)
+            self.combo_month_start.blockSignals(False)
 
     def _get_forecast_months(self) -> int:
         """获取实际预测月数（起止差值 + 1）"""
-        start = self.spin_month_start.value()
-        end = self.spin_month_end.value()
-        return end - start + 1
+        start = self._get_month_value(self.combo_month_start)
+        end = self._get_month_value(self.combo_month_end)
+        return max(1, end - start + 1)
 
-    def _set_month_preset(self, months: int):
-        """快捷预设按钮：如点"3个月"则设为起始1、结束3"""
-        self.spin_month_start.setValue(1)
-        self.spin_month_end.setValue(months)
 
     # ========== 搜索/预测 ==========
     def _on_search(self):
@@ -1387,10 +1629,12 @@ class SalesForecastWindow(QMainWindow):
         self.loading_overlay.hide()
         self.btn_search.setEnabled(True)
         dim_label = self.engine.DIMENSIONS.get(self.current_dimension, {}).get('label', '')
-        n_records = max(0, len(result_df) - 1) if result_df is not None else 0
+        n_records = max(0, len(result_df) - 1) if result_df is not None and not result_df.empty else 0
         self.statusBar().showMessage(
             f"\u9884\u6d4a\u5b8c\u6210 | \u5171 {n_records} \u6761\u8bb0\u5f55 | \u7ef4\u5ea6: {dim_label}"
         )
+        if (result_df is None or result_df.empty) and n_records == 0:
+            QMessageBox.information(self, "\u63d0\u793a", "\u672a\u627e\u5230\u7b26\u5408\u7b5b\u9009\u6761\u4ef6\u7684\u6570\u636e\uff0c\u8bf7\u8c03\u6574\u7b5b\u9009\u6761\u4ef6\u540e\u91cd\u8bd5\u3002")
 
     def _on_worker_error(self, msg: str):
         self.loading_overlay.hide()
@@ -1418,7 +1662,7 @@ class SalesForecastWindow(QMainWindow):
         self.table.setHorizontalHeaderLabels(columns)
         self.table.setRowCount(n_rows)
 
-        col_widths = {'\u6e20\u9053': 55, '\u578b\u53f7': 130, '\u7ec6\u5206\u7c7b': 90, '\u9884\u6d4b\u7b97\u6cd5': 65, '\u51c6\u786e\u7387': 60}
+        col_widths = {'渠道': 55, '型号': 130, '细分类': 90, '预测算法': 65, '准确率': 70, '数据状态': 65}
         for ci, col in enumerate(columns):
             self.table.setColumnWidth(ci, col_widths.get(col, 95))
 
@@ -1440,18 +1684,32 @@ class SalesForecastWindow(QMainWindow):
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable)
 
                 if ri == 0:
-                    item.setBackground(QBrush(QColor("#313244")))
-                    item.setForeground(QBrush(QColor("#f9e2af")))
+                    item.setBackground(QBrush(QColor("#e9ecef")))
+                    item.setForeground(QBrush(QColor("#212529")))
                     font = item.font()
                     font.setBold(True)
                     item.setFont(font)
-                elif ci >= 5:
+                # ---- 数据状态列：颜色标注 ----
+                if col == '数据状态':
+                    if text == '充足':
+                        item.setForeground(QBrush(QColor("#198754")))  # 深绿
+                    elif text == '一般':
+                        item.setForeground(QBrush(QColor("#fd7e14")))  # 琥珀色
+                    elif text == '不足':
+                        item.setForeground(QBrush(QColor("#e8590c")))  # 橙色
+                    else:  # 严重不足
+                        item.setForeground(QBrush(QColor("#dc3545")))  # 红色
+                # ---- 准确率列：数据不足时标红 ----
+                elif col == '准确率' and isinstance(val, str):
+                    item.setForeground(QBrush(QColor("#dc3545")))  # 红色
+                # ---- 预测值列：正负颜色 ----
+                elif ci >= 5 and col not in ('准确率', '数据状态', '预测算法'):
                     try:
                         v = float(str(val).replace(',', '')) if val else 0
                         if v > 0:
-                            item.setForeground(QBrush(QColor("#a6e3a1")))
-                        else:
-                            item.setForeground(QBrush(QColor("#f38ba8")))
+                            item.setForeground(QBrush(QColor("#198754")))
+                        elif v < 0:
+                            item.setForeground(QBrush(QColor("#dc3545")))
                     except (ValueError, TypeError):
                         pass
 
@@ -1476,8 +1734,8 @@ class SalesForecastWindow(QMainWindow):
         self.combo_model.setCurrentText('')
         self.combo_model.lineEdit().setPlaceholderText("\u8f93\u5165/\u9009\u62e9\u578b\u53f7\u5173\u952e\u8bcd...")
 
-        self.spin_month_start.setValue(1)
-        self.spin_month_end.setValue(5)
+        self.combo_month_start.setCurrentIndex(0)
+        self.combo_month_end.setCurrentIndex(4)  # 默认5月
 
         self.table.setColumnCount(0)
         self.table.setRowCount(0)

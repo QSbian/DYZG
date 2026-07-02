@@ -18,7 +18,8 @@ import csv
 import warnings
 from datetime import datetime
 from collections import OrderedDict
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict, Optional, Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -436,57 +437,60 @@ class ForecastEngine:
         latest_period = all_periods[-1]
         target_periods = self._generate_future_periods(latest_period, forecast_months)
 
-        # ---- 对每个分组执行预测 ----
-        results = []
+        # ---- 智能选择算法（根据数据量） ----
+        n_groups = len(pivot)
+        predictors = list(self.PREDICTORS)
+        if algorithm_filter:
+            predictors = [p for p in predictors if p.name in algorithm_filter]
+        # 渠道型号维度数据量大时，去掉最慢的 RF 和 HW
+        if dimension == 'model' and n_groups > 200 and not algorithm_filter:
+            predictors = [p for p in predictors if p.name not in ('RF', 'HW')]
+        elif dimension == 'subcategory' and n_groups > 100 and not algorithm_filter:
+            predictors = [p for p in predictors if p.name != 'RF']
 
+        # ---- 准备预测任务 ----
+        tasks = []
         for idx, row in pivot.iterrows():
             series_values = row.values.astype(float)
             if series_values.sum() < 1:
-                continue  # 全零跳过
-
-            # 为每个可用算法跑预测，选最优
-            best_algo_name = 'SMA'
-            best_forecast = None
-            best_acc = 0.0
-            algo_results = {}
-
-            predictors = self.PREDICTORS
-            if algorithm_filter:
-                predictors = [p for p in predictors if p.name in algorithm_filter]
-
-            for predictor in predictors:
-                try:
-                    forecast_arr, acc = predictor.fit_predict(series_values, forecast_months)
-                    algo_results[predictor.name] = (forecast_arr, acc)
-                    if acc > best_acc:
-                        best_acc = acc
-                        best_forecast = forecast_arr
-                        best_algo_name = predictor.name
-                except Exception as e:
-                    continue
-
-            if best_forecast is None:
                 continue
+            tasks.append((idx, series_values))
 
-            # 构造结果行
-            result_row = OrderedDict([
-                ('渠道', idx[0]),
-                ('型号', idx[3] if len(idx) > 3 else ''),
-                ('细分类', idx[2] if len(idx) > 2 else ''),
-                ('预测算法', best_algo_name),
-                ('准确率', round(best_acc, 2)),
-            ])
+        # ---- 并行执行预测 ----
+        results = []
+        max_workers = min(8, os.cpu_count() or 4)  # 最多8线程
+        completed = 0
+        total_tasks = len(tasks)
 
-            # 历史实际值（取最后几期用于对比）
-            hist_cols = list(pivot.columns)[-forecast_months:] if len(pivot.columns) >= forecast_months else list(pivot.columns)
-            for hc in hist_cols:
-                result_row[hc] = int(pivot.loc[idx, hc])
+        # 小数据量直接串行（避免线程开销）
+        if total_tasks <= 30 or max_workers <= 1:
+            for i, (idx, series_values) in enumerate(tasks):
+                result = self._predict_one_group(
+                    idx, series_values, predictors, forecast_months,
+                    pivot, target_periods
+                )
+                if result is not None:
+                    results.append(result)
+                completed += 1
+        else:
+            # 大数据量并行
+            def _task_fn(args):
+                idx, sv = args
+                return self._predict_one_group(
+                    idx, sv, predictors, forecast_months,
+                    pivot, target_periods
+                )
 
-            # 预测值
-            for tp, fv in zip(target_periods, best_forecast):
-                result_row[tp] = round(float(fv), 1)
-
-            results.append(result_row)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(_task_fn, t): t for t in tasks}
+                for future in as_completed(futures):
+                    try:
+                        result = future.result()
+                        if result is not None:
+                            results.append(result)
+                    except Exception:
+                        pass
+                    completed += 1
 
         if not results:
             return pd.DataFrame()
@@ -503,6 +507,45 @@ class ForecastEngine:
 
         self.result_df = result_df
         return result_df
+
+    def _predict_one_group(self, idx, series_values, predictors, forecast_months, pivot, target_periods):
+        """对单个分组执行预测（可被并行调用）"""
+        best_algo_name = 'SMA'
+        best_forecast = None
+        best_acc = 0.0
+
+        for predictor in predictors:
+            try:
+                forecast_arr, acc = predictor.fit_predict(series_values, forecast_months)
+                if acc > best_acc:
+                    best_acc = acc
+                    best_forecast = forecast_arr
+                    best_algo_name = predictor.name
+            except Exception:
+                continue
+
+        if best_forecast is None:
+            return None
+
+        # 构造结果行
+        result_row = OrderedDict([
+            ('渠道', idx[0]),
+            ('型号', idx[3] if len(idx) > 3 else ''),
+            ('细分类', idx[2] if len(idx) > 2 else ''),
+            ('预测算法', best_algo_name),
+            ('准确率', round(best_acc, 2)),
+        ])
+
+        # 历史实际值（取最后几期用于对比）
+        hist_cols = list(pivot.columns)[-forecast_months:] if len(pivot.columns) >= forecast_months else list(pivot.columns)
+        for hc in hist_cols:
+            result_row[hc] = int(pivot.loc[idx, hc])
+
+        # 预测值
+        for tp, fv in zip(target_periods, best_forecast):
+            result_row[tp] = round(float(fv), 1)
+
+        return result_row
 
     @staticmethod
     def _generate_future_periods(last_period: str, n: int) -> List[str]:
@@ -752,7 +795,25 @@ class ForecastWorker(QThread):
                 self.error.emit("没有可用的动销数据")
                 return
 
-            self.progress.emit(30, "数据加载完成，开始预测...")
+            # 先快速统计分组数，给用户预期
+            dim_info = self.engine.DIMENSIONS.get(self.dimension, self.engine.DIMENSIONS['model'])
+            groupby_cols = dim_info['groupby']
+            temp_df = df.copy()
+            if self.ch and self.ch != '全部':
+                temp_df = temp_df[temp_df['channel'] == self.ch]
+            if self.cat and self.cat != '全部':
+                temp_df = temp_df[temp_df['category'] == self.cat]
+            if self.subcat and self.subcat not in ('全部', None, ''):
+                temp_df = temp_df[temp_df['subcategory'] == self.subcat]
+            if self.model_kw and self.model_kw not in ('全部', None, ''):
+                temp_df = temp_df[temp_df['model'].str.contains(self.model_kw, na=False)]
+
+            n_groups = temp_df.groupby(groupby_cols)['sales_qty'].sum().astype(float)
+            n_active = (n_groups > 0).sum()
+            dim_label = dim_info['label']
+
+            self.progress.emit(30,
+                f"数据加载完成 | 维度: {dim_label} | 待预测: {n_active} 组 | 开始预测...")
 
             # 运行预测（这个最耗时）
             result_df = self.engine.run_forecast(
@@ -767,7 +828,8 @@ class ForecastWorker(QThread):
             if self._cancelled:
                 return
 
-            self.progress.emit(90, "预测完成，正在更新界面...")
+            n_results = max(0, len(result_df) - 1) if result_df is not None else 0
+            self.progress.emit(90, f"预测完成！共生成 {n_results} 条预测记录，正在更新界面...")
             self.finished.emit(result_df)
 
         except Exception as e:

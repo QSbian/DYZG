@@ -65,8 +65,27 @@ class DataLoader:
     def close(self):
         pass
 
+    @staticmethod
+    def _normalize_channel(channel: str) -> str:
+        """根据数据库报告将渠道归一化为线上/线下两类"""
+        if not isinstance(channel, str):
+            return '线下'
+        ch = channel.strip()
+        # 官方商城、电商&双品牌经营部等在线渠道统一归为线上
+        if ch in ('线上', '官方商城', '电商', '电商&双品牌经营部', '电商-双品牌经营部', '天猫', '京东', '苏宁'):
+            return '线上'
+        return '线下'
+
+    @staticmethod
+    def _clean_text(value, default: str = '未分类') -> str:
+        """清理文本字段：空值/NULL/纯空白替换为默认值"""
+        if pd.isna(value):
+            return default
+        s = str(value).strip()
+        return s if s else default
+
     def load_raw_data(self) -> pd.DataFrame:
-        """读取 vw_product_sales_customer_3 视图的动销数据"""
+        """读取 vw_product_sales_customer_3 视图的动销数据，并进行清洗"""
         conn = self._new_conn()
         try:
             query = """
@@ -82,26 +101,55 @@ class DataLoader:
             """
             df = pd.read_sql_query(query, conn)
             df['sales_qty'] = pd.to_numeric(df['sales_qty'], errors='coerce').fillna(0)
+
+            # 数据清洗：渠道归一化、空文本填充
+            df['channel'] = df['channel'].apply(self._normalize_channel)
+            df['category'] = df['category'].apply(lambda x: self._clean_text(x, '未分类'))
+            df['subcategory'] = df['subcategory'].apply(lambda x: self._clean_text(x, '未分类'))
+            df['model'] = df['model'].apply(lambda x: self._clean_text(x, '未命名'))
+
             return df
         finally:
             conn.close()
 
     def get_dimensions(self) -> Dict[str, list]:
-        """获取各筛选维度的唯一值"""
+        """获取各筛选维度的唯一值（基于数据库报告做渠道归一化与空值填充）"""
         conn = self._new_conn()
         try:
             cur = conn.cursor()
 
-            cur.execute("SELECT DISTINCT 渠道 FROM vw_product_sales_customer_3 WHERE 渠道 IS NOT NULL ORDER BY 渠道")
+            # 渠道归一化：线上/官方商城/电商相关归为线上，其余归为线下
+            cur.execute("""
+                SELECT DISTINCT
+                    CASE
+                        WHEN 渠道 IN ('线上', '官方商城', '电商', '电商&双品牌经营部', '电商-双品牌经营部', '天猫', '京东', '苏宁') THEN '线上'
+                        ELSE '线下'
+                    END AS ch
+                FROM vw_product_sales_customer_3
+                WHERE 渠道 IS NOT NULL AND 渠道 != ''
+                ORDER BY ch
+            """)
             channels = [r[0] for r in cur.fetchall()]
 
-            cur.execute("SELECT DISTINCT 品类 FROM vw_product_sales_customer_3 WHERE 品类 IS NOT NULL ORDER BY 品类")
+            cur.execute("""
+                SELECT DISTINCT COALESCE(NULLIF(TRIM(品类), ''), '未分类') AS cat
+                FROM vw_product_sales_customer_3
+                ORDER BY cat
+            """)
             categories = [r[0] for r in cur.fetchall()]
 
-            cur.execute("SELECT DISTINCT 细分类 FROM vw_product_sales_customer_3 WHERE 细分类 IS NOT NULL ORDER BY 细分类")
+            cur.execute("""
+                SELECT DISTINCT COALESCE(NULLIF(TRIM(细分类), ''), '未分类') AS sub
+                FROM vw_product_sales_customer_3
+                ORDER BY sub
+            """)
             subcategories = [r[0] for r in cur.fetchall()]
 
-            cur.execute("SELECT DISTINCT 型号 FROM vw_product_sales_customer_3 WHERE 型号 IS NOT NULL ORDER BY 型号")
+            cur.execute("""
+                SELECT DISTINCT COALESCE(NULLIF(TRIM(型号), ''), '未命名') AS m
+                FROM vw_product_sales_customer_3
+                ORDER BY m
+            """)
             models = [r[0] for r in cur.fetchall()]
 
             cur.execute("SELECT DISTINCT 账期 FROM vw_product_sales_customer_3 WHERE 账期 IS NOT NULL ORDER BY 账期")
@@ -792,22 +840,29 @@ QWidget#content_widget QLabel#dim_title { color: #5e4b8b; font-size: 18px; font-
 QWidget#content_widget QTableWidget {
     background-color: #ffffff;
     color: #333333;
-    gridline-color: #e0e0e0;
+    gridline-color: #e8e8e8;
     border: 1px solid #cccccc;
     border-radius: 6px;
-    selection-background-color: #cce5ff;
-    selection-color: #004085;
+    selection-background-color: #e7f1ff;
+    selection-color: #0a47a3;
 }
 QWidget#content_widget QTableWidget::item { padding: 4px 8px; }
-QWidget#content_widget QTableWidget::item:selected { color: #004085; background-color: #cce5ff; }
+QWidget#content_widget QTableWidget::item:selected { color: #0a47a3; background-color: #e7f1ff; }
 QWidget#content_widget QHeaderView::section {
-    background-color: #e9ecef;
+    background-color: #f1f3f5;
     color: #495057;
     padding: 6px 10px;
     border: none;
     border-right: 1px solid #dee2e6;
-    border-bottom: 2px solid #adb5bd;
+    border-bottom: 1px solid #ced4da;
     font-weight: bold;
+}
+QWidget#content_widget QHeaderView::section:vertical {
+    background-color: #f8f9fa;
+    color: #868e96;
+    border-right: 1px solid #dee2e6;
+    border-bottom: 1px solid #e9ecef;
+    font-weight: normal;
 }
 
 /* 内容区 - 按钮 */
@@ -906,7 +961,9 @@ QWidget#content_widget QGroupBox {
 QWidget#content_widget QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }
 
 /* ---- 全局 QStatusBar ---- */
-QStatusBar { color: #6c7086; font-size: 11px; background-color: #f0f0f0; }
+QMainWindow::statusBar { background-color: #f8f9fa; border-top: 1px solid #dee2e6; }
+QStatusBar { color: #6c757d; font-size: 11px; background-color: #f8f9fa; }
+QStatusBar::item { border: none; }
 QProgressBar { border: 1px solid #ced4da; border-radius: 3px; text-align: center; background-color: #e9ecef; color: #495057; height: 18px; }
 QProgressBar::chunk { background-color: #0d6efd; border-radius: 2px; }
 """
@@ -1169,6 +1226,16 @@ class ForecastWorker(QThread):
 # ============================================================
 #  主窗口：动销预测系统 UI（左侧导航 + 筛选区 + 结果表格）
 # ============================================================
+
+class NumericTableItem(QTableWidgetItem):
+    """支持按数值排序的表格项（用于准确率百分比列）"""
+    def __lt__(self, other):
+        try:
+            return float(self.data(Qt.UserRole)) < float(other.data(Qt.UserRole))
+        except (ValueError, TypeError, AttributeError):
+            return super().__lt__(other)
+
+
 class SalesForecastWindow(QMainWindow):
     """动销预测主窗口 v2"""
 
@@ -1377,7 +1444,7 @@ class SalesForecastWindow(QMainWindow):
         # --- 结果表格 ---
         self.table = QTableWidget()
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table.setAlternatingRowColors(True)
+        self.table.setAlternatingRowColors(False)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.verticalHeader().setDefaultSectionSize(28)
@@ -1672,6 +1739,13 @@ class SalesForecastWindow(QMainWindow):
                 val = row[col]
                 if pd.isna(val) or val == '':
                     text = ""
+                elif col == '准确率':
+                    # 准确率统一格式化为百分比，便于阅读与对比
+                    if isinstance(val, str):
+                        text = val
+                    else:
+                        acc_num = float(val)
+                        text = f"{acc_num:.2f}%"
                 elif isinstance(val, (float, np.floating)):
                     text = f"{val:.1f}" if val != int(val) else str(int(val))
                 elif isinstance(val, (int, np.integer)):
@@ -1679,12 +1753,16 @@ class SalesForecastWindow(QMainWindow):
                 else:
                     text = str(val)
 
-                item = QTableWidgetItem(text)
+                if col == '准确率' and not isinstance(val, str):
+                    item = NumericTableItem(text)
+                    item.setData(Qt.UserRole, float(val))
+                else:
+                    item = QTableWidgetItem(text)
                 item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable)
 
                 if ri == 0:
-                    item.setBackground(QBrush(QColor("#e9ecef")))
+                    item.setBackground(QBrush(QColor("#f1f3f5")))
                     item.setForeground(QBrush(QColor("#212529")))
                     font = item.font()
                     font.setBold(True)
@@ -1699,9 +1777,12 @@ class SalesForecastWindow(QMainWindow):
                         item.setForeground(QBrush(QColor("#e8590c")))  # 橙色
                     else:  # 严重不足
                         item.setForeground(QBrush(QColor("#dc3545")))  # 红色
-                # ---- 准确率列：数据不足时标红 ----
-                elif col == '准确率' and isinstance(val, str):
-                    item.setForeground(QBrush(QColor("#dc3545")))  # 红色
+                # ---- 准确率列：数值绿色显示，数据不足红色 ----
+                elif col == '准确率':
+                    if isinstance(val, str):
+                        item.setForeground(QBrush(QColor("#dc3545")))  # 红色：数据不足
+                    else:
+                        item.setForeground(QBrush(QColor("#198754")))  # 绿色：正常准确率
                 # ---- 预测值列：正负颜色 ----
                 elif ci >= 5 and col not in ('准确率', '数据状态', '预测算法'):
                     try:

@@ -1721,6 +1721,19 @@ class SalesForecastWindow(QMainWindow):
             self.table.setUpdatesEnabled(True)
             return
 
+        # ---- 去掉所有值均为空的列（针对不同维度只显示有值的列） ----
+        # 合计行（第0行）可能空，用数据行（第1行起）判断
+        cols_to_keep = []
+        for col in df.columns:
+            if len(df) <= 1:
+                cols_to_keep.append(col)
+            else:
+                data_vals = df[col].iloc[1:].dropna()
+                data_vals = data_vals[data_vals != '']
+                if len(data_vals) > 0:
+                    cols_to_keep.append(col)
+        df = df[cols_to_keep].copy()
+
         columns = list(df.columns)
         n_rows = len(df)
         n_cols = len(columns)

@@ -975,6 +975,56 @@ QWidget#content_widget QHeaderView::section:vertical {
     border-bottom: 1px solid #e9ecef;
     font-weight: normal;
 }
+/* 表格左上角交叉区域 */
+QWidget#content_widget QTableWidget::corner {
+    background-color: #e9ecef;
+    border-right: 1px solid #dee2e6;
+    border-bottom: 1px solid #ced4da;
+}
+
+/* 内容区 - 滚动条（改为蓝色系，不再是灰色） */
+QWidget#content_widget QScrollBar:vertical {
+    background-color: #e7f1ff;
+    width: 10px;
+    border-radius: 5px;
+}
+QWidget#content_widget QScrollBar::handle:vertical {
+    background-color: #74b0ff;
+    border-radius: 5px;
+    min-height: 30px;
+}
+QWidget#content_widget QScrollBar::handle:vertical:hover {
+    background-color: #4a9eff;
+}
+QWidget#content_widget QScrollBar::add-line:vertical,
+QWidget#content_widget QScrollBar::sub-line:vertical {
+    height: 0px;
+}
+QWidget#content_widget QScrollBar::add-page:vertical,
+QWidget#content_widget QScrollBar::sub-page:vertical {
+    background: none;
+}
+QWidget#content_widget QScrollBar:horizontal {
+    background-color: #e7f1ff;
+    height: 10px;
+    border-radius: 5px;
+}
+QWidget#content_widget QScrollBar::handle:horizontal {
+    background-color: #74b0ff;
+    border-radius: 5px;
+    min-width: 30px;
+}
+QWidget#content_widget QScrollBar::handle:horizontal:hover {
+    background-color: #4a9eff;
+}
+QWidget#content_widget QScrollBar::add-line:horizontal,
+QWidget#content_widget QScrollBar::sub-line:horizontal {
+    width: 0px;
+}
+QWidget#content_widget QScrollBar::add-page:horizontal,
+QWidget#content_widget QScrollBar::sub-page:horizontal {
+    background: none;
+}
 
 /* 内容区 - 按钮 */
 QWidget#content_widget QPushButton#btn_primary {

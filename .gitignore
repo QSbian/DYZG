@@ -1,0 +1,4 @@
+# Database files - too large and contain sensitive data
+*.sqlite
+*.db
+*.sqlite3

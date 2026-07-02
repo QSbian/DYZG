@@ -16,3 +16,4 @@ __pycache__/
 *.log
 *.tmp
 .DS_Store
+.db_history.json

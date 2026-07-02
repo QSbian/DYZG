@@ -76,6 +76,32 @@ class DataLoader:
         s = str(value).strip()
         return s if s else default
 
+    @staticmethod
+    def _map_category_group(category: str) -> str:
+        """根据业务参考图，将原始品类归并为大类"""
+        if not isinstance(category, str):
+            return '其他'
+        cat = category.strip()
+        if cat in ('家用电', '佳尼特电'):
+            return '电'
+        if cat in ('家用气', '佳尼特气'):
+            return '气'
+        if cat in ('净水', '佳尼特净水', '净水滤芯', '空净', '空净滤芯'):
+            return '净'
+        if cat in ('壁挂炉', '壁挂炉材料'):
+            return '壁挂炉'
+        if cat == '热泵':
+            return '热泵'
+        if cat in ('烟灶', '洗碗机', '蒸烤箱'):
+            return '厨'
+        if cat in ('冷暖风水', '水暖毯', 'AI-LiNK智能件', '五金卫浴'):
+            return '生态'
+        if cat == '生态':
+            return '生态'
+        if cat in ('其他', '商用', '未分类'):
+            return '其他'
+        return '其他'
+
     def load_raw_data(self) -> pd.DataFrame:
         """读取 vw_product_sales_customer_3 视图的动销数据，并进行清洗"""
         conn = self._new_conn()
@@ -94,11 +120,12 @@ class DataLoader:
             df = pd.read_sql_query(query, conn)
             df['sales_qty'] = pd.to_numeric(df['sales_qty'], errors='coerce').fillna(0)
 
-            # 数据清洗：渠道归一化、空文本填充
+            # 数据清洗：渠道归一化、空文本填充、大类归并
             df['channel'] = df['channel'].apply(self._normalize_channel)
             df['category'] = df['category'].apply(lambda x: self._clean_text(x, '未分类'))
             df['subcategory'] = df['subcategory'].apply(lambda x: self._clean_text(x, '未分类'))
             df['model'] = df['model'].apply(lambda x: self._clean_text(x, '未命名'))
+            df['大类'] = df['category'].apply(self._map_category_group)
 
             return df
         finally:
@@ -130,6 +157,9 @@ class DataLoader:
             """)
             categories = [r[0] for r in cur.fetchall()]
 
+            # 大类由原始品类映射得到
+            category_groups = sorted(set(self._map_category_group(c) for c in categories))
+
             cur.execute("""
                 SELECT DISTINCT COALESCE(NULLIF(TRIM(细分类), ''), '未分类') AS sub
                 FROM vw_product_sales_customer_3
@@ -150,6 +180,7 @@ class DataLoader:
             return {
                 'channels': channels,
                 'categories': categories,
+                'category_groups': category_groups,
                 'subcategories': subcategories,
                 'models': models,
                 'periods': periods,
@@ -490,10 +521,10 @@ class ForecastEngine:
         },
         'subcategory': {
             'groupby': ['channel', 'category', 'subcategory'],
-            'label': '渠道细分分类',
+            'label': '渠道细分类',
         },
         'category': {
-            'groupby': ['channel', 'category'],
+            'groupby': ['channel', '大类'],
             'label': '渠道大类',
         },
     }
@@ -594,7 +625,7 @@ class ForecastEngine:
             for i, (idx, series_values) in enumerate(tasks):
                 result = self._predict_one_group(
                     idx, series_values, predictors, forecast_months,
-                    pivot, target_periods
+                    pivot, target_periods, groupby_cols
                 )
                 if result is not None:
                     results.append(result)
@@ -604,7 +635,7 @@ class ForecastEngine:
                 idx, sv = args
                 return self._predict_one_group(
                     idx, sv, predictors, forecast_months,
-                    pivot, target_periods
+                    pivot, target_periods, groupby_cols
                 )
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -624,10 +655,12 @@ class ForecastEngine:
         result_df = pd.DataFrame(results)
 
         # 添加合计行
-        total_row = OrderedDict([('渠道', ''), ('型号', ''), ('细分类', ''), ('预测算法', ''), ('准确率', '')])
-        # 只对纯数值列做合计（排除含字符串的列如准确率、数据状态等）
+        # 非数值列（维度列、算法、准确率、数据状态）留空
+        string_cols = [c for c in result_df.columns if result_df[c].dtype.kind not in 'iuf']
+        total_row = OrderedDict((c, '') for c in string_cols)
+        # 只对纯数值列做合计
         numeric_cols = [c for c in result_df.columns
-                        if c not in ('渠道', '型号', '细分类', '预测算法', '准确率', '数据状态')
+                        if c not in string_cols
                         and result_df[c].dtype.kind in 'iuf']
         for col in numeric_cols:
             total_row[col] = int(result_df[col].sum()) if result_df[col].dtype.kind in 'iuf' else round(result_df[col].sum(), 1)
@@ -683,7 +716,7 @@ class ForecastEngine:
 
         return round(max(2.0, min(estimated, 120.0)), 1)
 
-    def _predict_one_group(self, idx, series_values, predictors, forecast_months, pivot, target_periods):
+    def _predict_one_group(self, idx, series_values, predictors, forecast_months, pivot, target_periods, groupby_cols):
         """对单个分组执行预测（用回溯验证选最优算法）
         
         数据充足度判断：
@@ -747,14 +780,21 @@ class ForecastEngine:
             best_acc = max(0.0, min(100.0, 100.0 - best_smape))
 
         # ---- 第三步：构建结果行 ----
-        result_row = OrderedDict([
-            ('渠道', idx[0]),
-            ('型号', idx[3] if len(idx) > 3 else ''),
-            ('细分类', idx[2] if len(idx) > 2 else ''),
-            ('预测算法', best_algo_name),
-            ('准确率', round(best_acc, 2) if best_acc is not None else '数据不足'),
-            ('数据状态', data_status),
-        ])
+        col_display_map = {
+            'channel': '渠道',
+            'category': '品类',
+            'subcategory': '细分类',
+            'model': '型号',
+            '大类': '大类',
+        }
+        result_row = OrderedDict()
+        # 按 groupby 顺序写入维度列
+        for col_name, val in zip(groupby_cols, idx):
+            display_name = col_display_map.get(col_name, col_name)
+            result_row[display_name] = val
+        result_row['预测算法'] = best_algo_name
+        result_row['准确率'] = round(best_acc, 2) if best_acc is not None else '数据不足'
+        result_row['数据状态'] = data_status
 
         hist_cols = list(pivot.columns)[-forecast_months:] if len(pivot.columns) >= forecast_months else list(pivot.columns)
         for hc in hist_cols:
@@ -1737,7 +1777,7 @@ class SalesForecastWindow(QMainWindow):
         self.table.setHorizontalHeaderLabels(columns)
         self.table.setRowCount(n_rows)
 
-        col_widths = {'渠道': 55, '型号': 130, '细分类': 90, '预测算法': 65, '准确率': 70, '数据状态': 65}
+        col_widths = {'渠道': 55, '型号': 130, '细分类': 90, '品类': 90, '大类': 90, '预测算法': 65, '准确率': 70, '数据状态': 65}
         for ci, col in enumerate(columns):
             self.table.setColumnWidth(ci, col_widths.get(col, 95))
 
@@ -1881,6 +1921,7 @@ def find_db_path():
         return sys.argv[1]
 
     candidates = [
+        r"C:\Users\cheng\Desktop\作业文件夹\实习\oms_sales_data.sqlite",
         os.path.join(os.path.dirname(__file__), '..', '\u4efb\u52a1\u4e94', 'oms_sales_data.sqlite'),
         r"C:\Users\cheng\Desktop\作业文件夹\实习\cangku\202321101063\任务五\oms_sales_data.sqlite",
         os.path.join(os.path.dirname(__file__), 'oms_sales_data.sqlite'),

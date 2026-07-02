@@ -4,14 +4,6 @@
 动销预测系统 (Sales Forecast System) v2
 ========================================
 基于 OMS 销售数据库的动销预测工具
-
-v2 改动：
-- 预测维度移至左侧导航栏，点击切换
-- 渠道筛选改为三按钮（线上 / 线下 / 线上和线下）
-- 型号支持输入 + 下拉选择 + 历史记录
-- 预计月份支持单月或月份区间
-- 加载动画显示预计耗时
-
 用法：python sales_forecast.py [数据库路径]
 默认数据库路径：../任务五/oms_sales_data.sqlite
 """
@@ -935,7 +927,6 @@ QWidget#content_widget QComboBox QAbstractItemView {
 QWidget#content_widget QComboBox QAbstractItemView::item { padding: 5px 10px; }
 QWidget#content_widget QComboBox QAbstractItemView::item:selected { background-color: #cce5ff; color: #004085; }
 QWidget#content_widget QComboBox QAbstractItemView::item:hover { background-color: #e9ecef; }
-QWidget#content_widget QComboBox QAbstractItemView { max-height: 200px; }
 
 /* 内容区 - QLineEdit */
 QWidget#content_widget QLineEdit {
@@ -1354,12 +1345,14 @@ class SalesForecastWindow(QMainWindow):
         filter_layout.addWidget(QLabel("\u54c1\u7c7b:"), 0, 3)
         self.combo_category = QComboBox()
         self.combo_category.setMinimumWidth(120)
+        self.combo_category.setMaxVisibleItems(10)  # 限制下拉列表最大显示项数，避免过长
         filter_layout.addWidget(self.combo_category, 0, 4)
 
         # 第二行：细分类 + 型号（可编辑下拉+历史）
         filter_layout.addWidget(QLabel("\u7ec6\u5206\u7c7b:"), 1, 0)
         self.combo_subcategory = QComboBox()
         self.combo_subcategory.setMinimumWidth(130)
+        self.combo_subcategory.setMaxVisibleItems(10)  # 限制下拉列表最大显示项数
         filter_layout.addWidget(self.combo_subcategory, 1, 1)
 
         filter_layout.addWidget(QLabel("\u578b\u53f7:"), 1, 2)
@@ -1368,6 +1361,7 @@ class SalesForecastWindow(QMainWindow):
         self.combo_model.setEditable(True)
         self.combo_model.setPlaceholderText("\u8f93\u5165/\u9009\u62e9\u578b\u53f7\u5173\u952e\u8bcd...")
         self.combo_model.setMinimumWidth(180)
+        self.combo_model.setMaxVisibleItems(10)  # 限制下拉列表最大显示项数
         self.combo_model.lineEdit().returnPressed.connect(self._on_model_enter_pressed)
         self.combo_model.currentTextChanged.connect(self._on_model_text_changed)
         # 自动补全

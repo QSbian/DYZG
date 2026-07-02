@@ -519,11 +519,12 @@ try:
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QGridLayout, QPushButton, QLineEdit, QLabel, QComboBox,
         QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox,
-        QSplitter, QGroupBox, QListWidget, QProgressBar, QFileDialog,
+        QSplitter, QGroupBox, QListWidget, QListWidgetItem, QProgressBar, QFileDialog,
         QCheckBox, QSpinBox, QDialog, QDialogButtonBox, QAbstractItemView,
+        QSizePolicy,
     )
-    from PySide6.QtCore import Qt, QTimer, Signal
-    from PySide6.QtGui import QFont, QColor, QBrush
+    from PySide6.QtCore import Qt, QTimer, Signal, QThread, QObject, QPropertyAnimation, QEasingCurve, QParallelAnimationGroup
+    from PySide6.QtGui import QFont, QColor, QBrush, QPalette, QPainter
     HAS_PYSIDE6 = True
 except ImportError:
     HAS_PYSIDE6 = False
@@ -615,6 +616,155 @@ QGroupBox {
 QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }
 """
 
+# ============================================================
+#  加载动画遮罩层
+# ============================================================
+class LoadingOverlay(QWidget):
+    """半透明加载遮罩，带旋转动画和文字提示"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("loading_overlay")
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self.setStyleSheet("""
+            QWidget#loading_overlay {
+                background-color: rgba(30, 30, 46, 200);
+                border-radius: 0px;
+            }
+            QLabel#loading_text {
+                color: #89b4fa;
+                font-size: 16px;
+                font-weight: bold;
+            }
+            QLabel#loading_sub {
+                color: #a6adc8;
+                font-size: 12px;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setAlignment(Qt.AlignCenter)
+        layout.setSpacing(16)
+
+        # 旋转动画文字
+        self.spinner_label = QLabel("⏳")
+        self.spinner_label.setObjectName("loading_text")
+        self.spinner_label.setAlignment(Qt.AlignCenter)
+        self.spinner_label.setFixedSize(64, 64)
+        font = QFont("Microsoft YaHei", 32)
+        self.spinner_label.setFont(font)
+        layout.addWidget(self.spinner_label)
+
+        self.text_label = QLabel("正在加载数据...")
+        self.text_label.setObjectName("loading_text")
+        self.text_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.text_label)
+
+        self.sub_label = QLabel("请稍候，预测计算进行中")
+        self.sub_label.setObjectName("loading_sub")
+        self.sub_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.sub_label)
+
+        # 旋转动画
+        self._angle = 0
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._rotate)
+        self._dots = 0
+        self._text_timer = QTimer(self)
+        self._text_timer.timeout.connect(self._update_text)
+
+    def _rotate(self):
+        self._angle = (self._angle + 12) % 360
+        # 用 ASCII 兼容的旋转字符
+        chars = ["|", "/", "-", "\\"]
+        idx = (self._angle // 90) % 4
+        self.spinner_label.setText(chars[idx])
+
+    def _update_text(self):
+        self._dots = (self._dots + 1) % 4
+        base = self._base_text
+        dots = "．" * self._dots
+        self.text_label.setText(base + dots)
+
+    def set_text(self, text: str):
+        self._base_text = text
+        self.text_label.setText(text)
+        self._dots = 0
+
+    def set_sub_text(self, text: str):
+        self.sub_label.setText(text)
+
+    def showEvent(self, event):
+        self._timer.start(60)    # ~16fps 旋转
+        self._text_timer.start(400)
+        self._base_text = self.text_label.text()
+        super().showEvent(event)
+
+    def hideEvent(self, event):
+        self._timer.stop()
+        self._text_timer.stop()
+        super().hideEvent(event)
+
+    def resizeEvent(self, event):
+        if self.parent():
+            self.resize(self.parent().size())
+        super().resizeEvent(event)
+
+
+# ============================================================
+#  后台预测线程
+# ============================================================
+class ForecastWorker(QThread):
+    """后台线程：运行预测，通过信号通知主线程"""
+    progress = Signal(int, str)   # (百分比, 提示文字)
+    finished = Signal(object)      # 预测结果 DataFrame
+    error = Signal(str)           # 错误信息
+
+    def __init__(self, engine, dimension, months, ch, cat, subcat, model_kw):
+        super().__init__()
+        self.engine = engine
+        self.dimension = dimension
+        self.months = months
+        self.ch = ch
+        self.cat = cat
+        self.subcat = subcat
+        self.model_kw = model_kw
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        try:
+            self.progress.emit(10, "正在加载数据...")
+            # 在后台线程中加载数据
+            df = self.engine.load_data()
+            if df is None or df.empty:
+                self.error.emit("没有可用的动销数据")
+                return
+
+            self.progress.emit(30, "数据加载完成，开始预测...")
+
+            # 运行预测（这个最耗时）
+            result_df = self.engine.run_forecast(
+                dimension=self.dimension,
+                forecast_months=self.months,
+                filter_channel=self.ch,
+                filter_category=self.cat,
+                filter_subcategory=self.subcat,
+                filter_model=self.model_kw,
+            )
+
+            if self._cancelled:
+                return
+
+            self.progress.emit(90, "预测完成，正在更新界面...")
+            self.finished.emit(result_df)
+
+        except Exception as e:
+            import traceback
+            self.error.emit(f"预测出错: {e}\n{traceback.format_exc()}")
+
 
 class SalesForecastWindow(QMainWindow):
     """动销预测主窗口"""
@@ -628,6 +778,7 @@ class SalesForecastWindow(QMainWindow):
         self.engine = ForecastEngine(self.data_loader)
         self.current_result_df = None
         self.dimensions_data = {}
+        self.worker = None       # 后台线程引用
         self.setWindowTitle("动销预测系统 — DYZG OMS")
         self.setMinimumSize(1200, 750)
         self.resize(1350, 800)
@@ -637,6 +788,7 @@ class SalesForecastWindow(QMainWindow):
         self._setup_ui()
         self._load_initial_data()
 
+    # ========== UI 搭建 ==========
     def _setup_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
@@ -779,7 +931,11 @@ class SalesForecastWindow(QMainWindow):
 
         main_layout.addWidget(content, stretch=1)
 
-    def _load_initial_data(self):
+        # ===== 加载动画遮罩 =====
+        self.loading_overlay = LoadingOverlay(self)
+        self.loading_overlay.hide()
+
+    # ========== 数据加载 ==========
         """初始化时加载维度数据填充下拉框"""
         self.statusBar().showMessage("正在加载数据...")
         QApplication.processEvents()
@@ -824,7 +980,11 @@ class SalesForecastWindow(QMainWindow):
         pass  # 维度变化在搜索时处理即可
 
     def _on_search(self):
-        """执行搜索和预测"""
+        """执行搜索和预测（启动后台线程）"""
+        if self.worker and self.worker.isRunning():
+            self.worker.cancel()
+            self.worker.wait(1000)
+
         dim_key = self._get_current_dimension_key()
         channel = self.combo_channel.currentText() if self.combo_channel.currentIndex() > 0 else None
         category = self.combo_category.currentText() if self.combo_category.currentIndex() > 0 else None
@@ -832,80 +992,87 @@ class SalesForecastWindow(QMainWindow):
         model_kw = self.input_model.text().strip() or None
         months = self.spin_months.value()
 
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setValue(10)
+        # 显示加载遮罩
+        self.loading_overlay.set_text("正在预测计算")
+        self.loading_overlay.set_sub_text("维度：%s  |  预测月数：%d" % (self.combo_dimension.currentText(), months))
+        self.loading_overlay.show()
+        self.loading_overlay.raise_()
+
         self.btn_search.setEnabled(False)
-        self.statusBar().showMessage("正在执行预测，请稍候...")
+        self.statusBar().showMessage("正在后台预测，界面可自由操作...")
 
-        # 异步执行避免界面卡顿
-        QTimer.singleShot(50, lambda: self._do_forecast(dim_key, months, channel, category, subcat, model_kw))
+        # 启动后台线程
+        self.worker = ForecastWorker(
+            engine=self.engine,
+            dimension=dim_key,
+            months=months,
+            ch=channel, cat=category, subcat=subcat, model_kw=model_kw,
+        )
+        self.worker.progress.connect(self._on_worker_progress)
+        self.worker.finished.connect(self._on_worker_finished)
+        self.worker.error.connect(self._on_worker_error)
+        self.worker.start()
 
-    def _do_forecast(self, dimension, months, ch, cat, subcat, model_kw):
-        try:
-            self.progress_bar.setValue(30)
-            QApplication.processEvents()
+    def _on_worker_progress(self, pct: int, text: str):
+        self.loading_overlay.set_text(text)
+        self.statusBar().showMessage(text)
 
-            result_df = self.engine.run_forecast(
-                dimension=dimension,
-                forecast_months=months,
-                filter_channel=ch,
-                filter_category=cat,
-                filter_subcategory=subcat,
-                filter_model=model_kw,
-            )
+    def _on_worker_finished(self, result_df):
+        self.current_result_df = result_df
+        self._populate_table(result_df)
+        self.loading_overlay.hide()
+        self.btn_search.setEnabled(True)
+        self.statusBar().showMessage(
+            "预测完成 | 共 %d 条记录 | 维度：%s"
+            % (max(0, len(result_df) - 1), self.combo_dimension.currentText())
+        )
 
-            self.progress_bar.setValue(80)
-            QApplication.processEvents()
-
-            self.current_result_df = result_df
-            self._populate_table(result_df)
-
-            self.progress_bar.setValue(100)
-            self.statusBar().showMessage(
-                f"预测完成 | 共 {len(result_df)-1} 条记录 | 维度: {self.combo_dimension.currentText()}"
-            )
-
-        except Exception as e:
-            self.statusBar().showMessage(f"预测出错: {e}")
-            QMessageBox.warning(self, "警告", f"预测过程出错:\n{e}")
-        finally:
-            self.progress_bar.setVisible(False)
-            self.btn_search.setEnabled(True)
+    def _on_worker_error(self, msg: str):
+        self.loading_overlay.hide()
+        self.btn_search.setEnabled(True)
+        self.statusBar().showMessage("预测出错")
+        QMessageBox.warning(self, "警告", msg[:500])
 
     def _populate_table(self, df: pd.DataFrame):
-        """将预测结果填充到表格中"""
+        """将预测结果填充到表格（优化版：批量操作）"""
+        self.table.setUpdatesEnabled(False)
         self.table.setSortingEnabled(False)
 
-        if df.empty or len(df) == 0:
+        if df is None or df.empty or len(df) == 0:
             self.table.setColumnCount(0)
             self.table.setRowCount(0)
+            self.table.setUpdatesEnabled(True)
             return
 
         columns = list(df.columns)
-        self.table.setColumnCount(len(columns))
-        self.table.setHorizontalHeaderLabels(columns)
+        n_rows = len(df)
+        n_cols = len(columns)
 
-        # 设置列宽
+        self.table.setColumnCount(n_cols)
+        self.table.setHorizontalHeaderLabels(columns)
+        self.table.setRowCount(n_rows)
+
+        # 列宽预设
         col_widths = {'渠道': 55, '型号': 130, '细分类': 90, '预测算法': 65, '准确率': 60}
         for ci, col in enumerate(columns):
-            width = col_widths.get(col, 95)
-            self.table.setColumnWidth(ci, width)
+            self.table.setColumnWidth(ci, col_widths.get(col, 95))
 
-        self.table.setRowCount(len(df))
-
-        for ri, (_, row) in enumerate(df.iterrows()):
+        # 批量填充
+        is_float = df.apply(lambda col: col.map(lambda x: isinstance(x, (float, np.floating))).any() if col.dtype == 'object' else col.dtype.kind in 'iuf')
+        for ri in range(n_rows):
+            row = df.iloc[ri]
             for ci, col in enumerate(columns):
                 val = row[col]
                 if pd.isna(val) or val == '':
-                    item = QTableWidgetItem("")
-                elif isinstance(val, float):
-                    display_val = f"{val:.1f}" if val != int(val) else str(int(val))
-                    item = QTableWidgetItem(display_val)
+                    text = ""
+                elif isinstance(val, (float, np.floating)):
+                    text = f"{val:.1f}" if val != int(val) else str(int(val))
                 elif isinstance(val, (int, np.integer)):
-                    item = QTableWidgetItem(str(int(val)))
+                    text = str(int(val))
                 else:
-                    item = QTableWidgetItem(str(val))
+                    text = str(val)
 
+                item = QTableWidgetItem(text)
                 item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable)
 
@@ -916,20 +1083,19 @@ class SalesForecastWindow(QMainWindow):
                     font = item.font()
                     font.setBold(True)
                     item.setFont(font)
-                elif ci >= 5:  # 数值列颜色
+                elif ci >= 5:
                     try:
                         v = float(str(val).replace(',', '')) if val else 0
                         if v > 0:
-                            item.setForeground(QBrush(QColor("#a6e3a1")))  # 绿色正数
+                            item.setForeground(QBrush(QColor("#a6e3a1")))
                         else:
-                            item.setForeground(QBrush(QColor("#f38ba8")))  # 红色负/零
-                    except ValueError:
+                            item.setForeground(QBrush(QColor("#f38ba8")))
+                    except (ValueError, TypeError):
                         pass
 
                 self.table.setItem(ri, ci, item)
 
-        # 冻结左侧5列
-        self.table.setFrozenColumns(5)
+        self.table.setUpdatesEnabled(True)
         self.table.setSortingEnabled(True)
 
     def _on_reset(self):
@@ -971,6 +1137,10 @@ class SalesForecastWindow(QMainWindow):
         self.statusBar().showMessage("数据已刷新")
 
     def closeEvent(self, event):
+        if self.worker and self.worker.isRunning():
+            self.worker.cancel()
+            self.worker.quit()
+            self.worker.wait(3000)
         self.data_loader.close()
         super().closeEvent(event)
 

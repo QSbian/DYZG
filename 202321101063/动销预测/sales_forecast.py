@@ -2100,6 +2100,15 @@ class SalesForecastWindow(QMainWindow):
                     cols_to_keep.append(col)
         df = df[cols_to_keep].copy()
 
+        # ---- 数据行按状态排序：优先展示无问题数据 ----
+        if len(df) > 1 and '数据状态' in df.columns:
+            status_order = {'充足': 0, '一般': 1, '不足': 2, '严重不足': 3}
+            df_data = df.iloc[1:].copy()
+            df_data['_sort_key'] = df_data['数据状态'].map(status_order).fillna(9)
+            df_data = df_data.sort_values('_sort_key')
+            df_data = df_data.drop(columns=['_sort_key'])
+            df = pd.concat([df.iloc[[0]], df_data], ignore_index=True)
+
         columns = list(df.columns)
         n_rows = len(df)
         n_cols = len(columns)

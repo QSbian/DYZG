@@ -590,12 +590,12 @@ try:
         QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox,
         QSplitter, QGroupBox, QListWidget, QListWidgetItem, QProgressBar, QFileDialog,
         QCheckBox, QSpinBox, QDialog, QDialogButtonBox, QAbstractItemView,
-        QSizePolicy, QButtonGroup, QRadioButton,
+        QSizePolicy, QButtonGroup, QRadioButton, QCompleter,
     )
-    from PySide6.QtCore import Qt, QTimer, Signal, QThread, QObject, QPropertyAnimation, QEasingCurve, QCompleter
+    from PySide6.QtCore import Qt, QTimer, Signal, QThread, QObject, QPropertyAnimation, QEasingCurve
     from PySide6.QtGui import QFont, QColor, QBrush, QPalette, QPainter
     HAS_PYSIDE6 = True
-except ImportError:
+except ImportError as _e:
     HAS_PYSIDE6 = False
 
 
@@ -1576,12 +1576,22 @@ def main():
                         "-i", "https://pypi.tuna.tsinghua.edu.cn/simple"]
             print("\n[信息] 正在安装 PySide6，请稍候...\n")
             ret = subprocess.run(pip_cmd, check=False)
-            if ret.returncode == 0:
-                print("\n[成功] PySide6 安装完成！请重新运行本程序。")
+
+            # 真正验证安装是否可用（而不仅仅看 pip 返回码）
+            py_cp = subprocess.run(
+                [sys.executable, "-c", "import PySide6; print('PySide6', PySide6.__version__)"],
+                capture_output=True, text=True, check=False
+            )
+            if py_cp.returncode == 0:
+                ver = py_cp.stdout.strip().replace("PySide6 ", "")
+                print(f"\n[成功] PySide6 安装完成（版本 {ver}）！请重新运行本程序。")
             else:
-                print("\n[错误] 安装失败。")
+                print("\n[错误] pip 安装成功，但 import PySide6 仍失败。")
+                print("可能原因：pip 安装到了其他 Python 环境。")
                 print("请在 VS Code 终端手动执行以下命令：")
                 print(f'  "{sys.executable}" -m pip install PySide6')
+                print("安装完成后，在 VS Code 终端运行以下命令验证：")
+                print(f'  "{sys.executable}" -c "import PySide6; print(PySide6.__version__)"')
         else:
             print("\n[信息] 已退出。")
 

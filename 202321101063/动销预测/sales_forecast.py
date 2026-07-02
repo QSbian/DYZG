@@ -35,68 +35,77 @@ warnings.filterwarnings('ignore', category=FutureWarning)
 # ============================================================
 
 class DataLoader:
-    """从 SQLite 加载动销数据，不修改原始数据库"""
+    """从 SQLite 加载动销数据，不修改原始数据库。
+    
+    线程安全：每次查询都创建独立的连接，避免跨线程共享连接报错。
+    """
 
     def __init__(self, db_path: str):
         self.db_path = db_path
-        self._conn = None
+
+    def _new_conn(self):
+        """每次调用返回一个全新的连接（线程安全）"""
+        return sqlite3.connect(self.db_path)
 
     def connect(self):
-        if self._conn is None:
-            self._conn = sqlite3.connect(self.db_path)
-        return self._conn
+        # 兼容旧接口，返回新连接（调用方需自行关闭）
+        return self._new_conn()
 
     def close(self):
-        if self._conn:
-            self._conn.close()
-            self._conn = None
+        pass  # 不再持有持久连接，无需关闭
 
     def load_raw_data(self) -> pd.DataFrame:
         """读取 vw_product_sales_customer_3 视图的动销数据"""
-        conn = self.connect()
-        query = """
-            SELECT 账期 AS period,
-                   渠道 AS channel,
-                   品类 AS category,
-                   细分类 AS subcategory,
-                   型号 AS model,
-                   动销 AS sales_qty
-            FROM vw_product_sales_customer_3
-            WHERE 动销 IS NOT NULL AND 动销 > 0
-            ORDER BY 账期
-        """
-        df = pd.read_sql_query(query, conn)
-        # 确保数值类型
-        df['sales_qty'] = pd.to_numeric(df['sales_qty'], errors='coerce').fillna(0)
-        return df
+        conn = self._new_conn()
+        try:
+            query = """
+                SELECT 账期 AS period,
+                       渠道 AS channel,
+                       品类 AS category,
+                       细分类 AS subcategory,
+                       型号 AS model,
+                       动销 AS sales_qty
+                FROM vw_product_sales_customer_3
+                WHERE 动销 IS NOT NULL AND 动销 > 0
+                ORDER BY 账期
+            """
+            df = pd.read_sql_query(query, conn)
+            # 确保数值类型
+            df['sales_qty'] = pd.to_numeric(df['sales_qty'], errors='coerce').fillna(0)
+            return df
+        finally:
+            conn.close()
 
     def get_dimensions(self) -> Dict[str, list]:
         """获取各筛选维度的唯一值"""
-        conn = self.connect()
-        cur = conn.cursor()
+        conn = self._new_conn()
+        try:
+            cur = conn.cursor()
 
-        cur.execute("SELECT DISTINCT 渠道 FROM vw_product_sales_customer_3 WHERE 渠道 IS NOT NULL ORDER BY 渠道")
-        channels = [r[0] for r in cur.fetchall()]
+            cur.execute("SELECT DISTINCT 渠道 FROM vw_product_sales_customer_3 WHERE 渠道 IS NOT NULL ORDER BY 渠道")
+            channels = [r[0] for r in cur.fetchall()]
 
-        cur.execute("SELECT DISTINCT 品类 FROM vw_product_sales_customer_3 WHERE 品类 IS NOT NULL ORDER BY 品类")
-        categories = [r[0] for r in cur.fetchall()]
+            cur.execute("SELECT DISTINCT 品类 FROM vw_product_sales_customer_3 WHERE 品类 IS NOT NULL ORDER BY 品类")
+            categories = [r[0] for r in cur.fetchall()]
 
-        cur.execute("SELECT DISTINCT 细分类 FROM vw_product_sales_customer_3 WHERE 细分类 IS NOT NULL ORDER BY 细分类")
-        subcategories = [r[0] for r in cur.fetchall()]
+            cur.execute("SELECT DISTINCT 细分类 FROM vw_product_sales_customer_3 WHERE 细分类 IS NOT NULL ORDER BY 细分类")
+            subcategories = [r[0] for r in cur.fetchall()]
 
-        cur.execute("SELECT DISTINCT 型号 FROM vw_product_sales_customer_3 WHERE 型号 IS NOT NULL ORDER BY 型号")
-        models = [r[0] for r in cur.fetchall()]
+            cur.execute("SELECT DISTINCT 型号 FROM vw_product_sales_customer_3 WHERE 型号 IS NOT NULL ORDER BY 型号")
+            models = [r[0] for r in cur.fetchall()]
 
-        cur.execute("SELECT DISTINCT 账期 FROM vw_product_sales_customer_3 WHERE 账期 IS NOT NULL ORDER BY 账期")
-        periods = [r[0] for r in cur.fetchall()]
+            cur.execute("SELECT DISTINCT 账期 FROM vw_product_sales_customer_3 WHERE 账期 IS NOT NULL ORDER BY 账期")
+            periods = [r[0] for r in cur.fetchall()]
 
-        return {
-            'channels': channels,
-            'categories': categories,
-            'subcategories': subcategories,
-            'models': models,
-            'periods': periods,
-        }
+            return {
+                'channels': channels,
+                'categories': categories,
+                'subcategories': subcategories,
+                'models': models,
+                'periods': periods,
+            }
+        finally:
+            conn.close()
 
 
 # ============================================================
@@ -935,7 +944,8 @@ class SalesForecastWindow(QMainWindow):
         self.loading_overlay = LoadingOverlay(self)
         self.loading_overlay.hide()
 
-    # ========== 数据加载 ==========
+    # ========== 初始数据加载 ==========
+    def _load_initial_data(self):
         """初始化时加载维度数据填充下拉框"""
         self.statusBar().showMessage("正在加载数据...")
         QApplication.processEvents()

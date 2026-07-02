@@ -188,6 +188,39 @@ class DataLoader:
         finally:
             conn.close()
 
+    def get_subcategories_by_category(self, category: str) -> List[str]:
+        """根据品类获取其下的细分类列表（用于品类-细分类联动）"""
+        if category in (None, '', '全部'):
+            dims = self.get_dimensions()
+            return dims['subcategories']
+        conn = self._new_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT DISTINCT COALESCE(NULLIF(TRIM(细分类), ''), '未分类') AS sub
+                FROM vw_product_sales_customer_3
+                WHERE COALESCE(NULLIF(TRIM(品类), ''), '未分类') = ?
+                ORDER BY sub
+            """, (category,))
+            return [r[0] for r in cur.fetchall()]
+        finally:
+            conn.close()
+
+    def get_years(self) -> List[int]:
+        """获取数据库中存在的年份列表"""
+        conn = self._new_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT DISTINCT SUBSTR(账期, 1, 4) AS yr
+                FROM vw_product_sales_customer_3
+                WHERE 账期 IS NOT NULL
+                ORDER BY yr
+            """)
+            return [int(r[0]) for r in cur.fetchall()]
+        finally:
+            conn.close()
+
 
 # ============================================================
 #  预测算法模块
@@ -516,7 +549,7 @@ class ForecastEngine:
     # =========================================================
     DIMENSIONS = {
         'model': {
-            'groupby': ['channel', 'category', 'subcategory', 'model'],
+            'groupby': ['channel', 'model', 'category', 'subcategory'],
             'label': '渠道型号',
         },
         'subcategory': {
@@ -1385,14 +1418,15 @@ class SalesForecastWindow(QMainWindow):
         filter_layout.addWidget(QLabel("\u54c1\u7c7b:"), 0, 3)
         self.combo_category = QComboBox()
         self.combo_category.setMinimumWidth(120)
-        self.combo_category.setMaxVisibleItems(10)  # 限制下拉列表最大显示项数，避免过长
+        self.combo_category.setMaxVisibleItems(10)
+        self.combo_category.currentTextChanged.connect(self._on_category_changed)
         filter_layout.addWidget(self.combo_category, 0, 4)
 
         # 第二行：细分类 + 型号（可编辑下拉+历史）
         filter_layout.addWidget(QLabel("\u7ec6\u5206\u7c7b:"), 1, 0)
         self.combo_subcategory = QComboBox()
         self.combo_subcategory.setMinimumWidth(130)
-        self.combo_subcategory.setMaxVisibleItems(10)  # 限制下拉列表最大显示项数
+        self.combo_subcategory.setMaxVisibleItems(10)
         filter_layout.addWidget(self.combo_subcategory, 1, 1)
 
         filter_layout.addWidget(QLabel("\u578b\u53f7:"), 1, 2)
@@ -1413,39 +1447,52 @@ class SalesForecastWindow(QMainWindow):
             model_completer.setCaseSensitivity(Qt.CaseInsensitive)
         filter_layout.addWidget(self.combo_model, 1, 3, 1, 2)
 
-        # 第三行：预测月份（起始月 ~ 结束月）
-        filter_layout.addWidget(QLabel("预测月份:"), 2, 0)
+        # 第三行：预测时间（起始年/月 至 结束年/月）
+        filter_layout.addWidget(QLabel("预测时间:"), 2, 0)
 
-        month_widget = QWidget()
-        month_layout = QHBoxLayout(month_widget)
-        month_layout.setContentsMargins(0, 0, 0, 0)
-        month_layout.setSpacing(6)
+        time_widget = QWidget()
+        time_layout = QHBoxLayout(time_widget)
+        time_layout.setContentsMargins(0, 0, 0, 0)
+        time_layout.setSpacing(4)
 
-        # 起始月份下拉框（可编辑）
+        # 起始年
+        self.combo_year_start = QComboBox()
+        self.combo_year_start.setMinimumWidth(62)
+        self.combo_year_start.setMaximumWidth(72)
+        time_layout.addWidget(self.combo_year_start)
+        # 起始月
         self.combo_month_start = QComboBox()
-        self.combo_month_start.setEditable(True)
-        self.combo_month_start.setMinimumWidth(80)
-        self.combo_month_start.setMaximumWidth(100)
-        for m in range(1, 37):
-            self.combo_month_start.addItem(f"{m}月")
-        self.combo_month_start.setCurrentIndex(0)  # 默认1月
-        month_layout.addWidget(self.combo_month_start)
-        month_layout.addWidget(QLabel("~"))
-        # 结束月份下拉框（可编辑）
+        self.combo_month_start.setMinimumWidth(52)
+        self.combo_month_start.setMaximumWidth(60)
+        time_layout.addWidget(self.combo_month_start)
+
+        time_layout.addWidget(QLabel("至"))
+
+        # 结束年
+        self.combo_year_end = QComboBox()
+        self.combo_year_end.setMinimumWidth(62)
+        self.combo_year_end.setMaximumWidth(72)
+        time_layout.addWidget(self.combo_year_end)
+        # 结束月
         self.combo_month_end = QComboBox()
-        self.combo_month_end.setEditable(True)
-        self.combo_month_end.setMinimumWidth(80)
-        self.combo_month_end.setMaximumWidth(100)
-        for m in range(1, 37):
+        self.combo_month_end.setMinimumWidth(52)
+        self.combo_month_end.setMaximumWidth(60)
+        time_layout.addWidget(self.combo_month_end)
+
+        # 月份固定 1~12
+        for m in range(1, 13):
+            self.combo_month_start.addItem(f"{m}月")
             self.combo_month_end.addItem(f"{m}月")
-        self.combo_month_end.setCurrentIndex(4)  # 默认5月
-        month_layout.addWidget(self.combo_month_end)
+        self.combo_month_start.setCurrentIndex(0)   # 默认 1月
+        self.combo_month_end.setCurrentIndex(4)      # 默认 5月
 
-        # 起止联动约束
-        self.combo_month_start.currentTextChanged.connect(self._on_month_start_changed)
-        self.combo_month_end.currentTextChanged.connect(self._on_month_end_changed)
+        # 起止时间联动约束
+        self.combo_year_start.currentTextChanged.connect(self._on_time_range_changed)
+        self.combo_month_start.currentTextChanged.connect(self._on_time_range_changed)
+        self.combo_year_end.currentTextChanged.connect(self._on_time_range_changed)
+        self.combo_month_end.currentTextChanged.connect(self._on_time_range_changed)
 
-        filter_layout.addWidget(month_widget, 2, 1, 1, 2)
+        filter_layout.addWidget(time_widget, 2, 1, 1, 2)
 
         # 第四行：操作按钮组
         btn_layout = QHBoxLayout()
@@ -1509,7 +1556,8 @@ class SalesForecastWindow(QMainWindow):
             QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }
         """
         combos = [self.combo_category, self.combo_subcategory, self.combo_model,
-                  self.combo_month_start, self.combo_month_end]
+                  self.combo_month_start, self.combo_month_end,
+                  self.combo_year_start, self.combo_year_end]
         for combo in combos:
             view = combo.view()
             if view:
@@ -1527,13 +1575,29 @@ class SalesForecastWindow(QMainWindow):
             categories = self.dimensions_data.get('categories', [])
             subcategories = self.dimensions_data.get('subcategories', [])
             models = self.dimensions_data.get('models', [])
+            years = self.data_loader.get_years()
+
+            # 年份下拉框（起止共用）
+            year_items = [str(y) for y in years]
+            for combo in (self.combo_year_start, self.combo_year_end):
+                combo.clear()
+                combo.addItems(year_items)
+            if year_items:
+                # 默认起始年 = 最后一个有数据的年份
+                last_year = year_items[-1]
+                self.combo_year_start.setCurrentIndex(len(year_items) - 1)
+                self.combo_year_end.setCurrentIndex(len(year_items) - 1)
+            self.combo_month_start.setCurrentIndex(0)   # 1月
+            self.combo_month_end.setCurrentIndex(4)      # 5月
 
             # 品类
+            self.combo_category.blockSignals(True)
             self.combo_category.clear()
             self.combo_category.addItem('\u5168\u90e8')
             self.combo_category.addItems(categories)
+            self.combo_category.blockSignals(False)
 
-            # 细分类
+            # 细分类（初始加载全部，后续按品类联动过滤）
             self.combo_subcategory.clear()
             self.combo_subcategory.addItem('\u5168\u90e8')
             self.combo_subcategory.addItems(subcategories)
@@ -1629,43 +1693,54 @@ class SalesForecastWindow(QMainWindow):
         """型号文本变化时的实时过滤提示（可选增强）"""
         pass  # QCompleter 已自动处理补全
 
-    # ========== 月份区间处理 ==========
-    def _get_month_value(self, combo) -> int:
-        """从月份下拉框安全读取值（支持手动输入）"""
+    # ========== 品类-细分类联动 ==========
+    def _on_category_changed(self, text: str):
+        """当品类选择变化时，更新细分类下拉列表"""
+        self.combo_subcategory.blockSignals(True)
+        self.combo_subcategory.clear()
+        self.combo_subcategory.addItem('全部')
+        subcats = self.data_loader.get_subcategories_by_category(text if text != '全部' else None)
+        self.combo_subcategory.addItems(subcats)
+        self.combo_subcategory.blockSignals(False)
+
+    # ========== 预测时间区间处理 ==========
+    def _get_month_num(self, combo) -> int:
+        """从月份下拉框读取数值"""
         text = combo.currentText().strip()
-        # 提取数字
         m = re.search(r'(\d+)', text)
-        if m:
-            val = int(m.group(1))
-            return max(1, min(36, val))
-        return 1
+        return max(1, min(12, int(m.group(1)))) if m else 1
 
-    def _on_month_start_changed(self, text: str):
-        """起始月份变化时确保不超过结束月份"""
-        start = self._get_month_value(self.combo_month_start)
-        end = self._get_month_value(self.combo_month_end)
-        if start > end:
-            # 设置结束月份为相同值
-            idx = max(0, min(35, start - 1))
+    def _parse_ym(self, year_combo, month_combo) -> tuple:
+        """读取年+月，返回 (year, month) 元组"""
+        y = int(year_combo.currentText())
+        m = self._get_month_num(month_combo)
+        return y, m
+
+    def _on_time_range_changed(self, *args):
+        """时间范围联动约束：确保起始 <= 结束"""
+        sy, sm = self._parse_ym(self.combo_year_start, self.combo_month_start)
+        ey, em = self._parse_ym(self.combo_year_end, self.combo_month_end)
+
+        start_val = sy * 100 + sm
+        end_val = ey * 100 + em
+
+        if start_val > end_val:
+            # 起始时间超过结束时间，修正结束时间到相同值
+            self.combo_year_end.blockSignals(True)
             self.combo_month_end.blockSignals(True)
-            self.combo_month_end.setCurrentIndex(idx)
+            idx_y = self.combo_year_end.findText(str(sy))
+            if idx_y >= 0:
+                self.combo_year_end.setCurrentIndex(idx_y)
+            self.combo_month_end.setCurrentIndex(sm - 1)
             self.combo_month_end.blockSignals(False)
-
-    def _on_month_end_changed(self, text: str):
-        """结束月份变化时确保不小于起始月份"""
-        start = self._get_month_value(self.combo_month_start)
-        end = self._get_month_value(self.combo_month_end)
-        if end < start:
-            idx = max(0, min(35, end - 1))
-            self.combo_month_start.blockSignals(True)
-            self.combo_month_start.setCurrentIndex(idx)
-            self.combo_month_start.blockSignals(False)
+            self.combo_year_end.blockSignals(False)
 
     def _get_forecast_months(self) -> int:
-        """获取实际预测月数（起止差值 + 1）"""
-        start = self._get_month_value(self.combo_month_start)
-        end = self._get_month_value(self.combo_month_end)
-        return max(1, end - start + 1)
+        """根据起止年/月计算预测月数"""
+        sy, sm = self._parse_ym(self.combo_year_start, self.combo_month_start)
+        ey, em = self._parse_ym(self.combo_year_end, self.combo_month_end)
+        total = (ey - sy) * 12 + (em - sm) + 1
+        return max(1, total)
 
 
     # ========== 搜索/预测 ==========
@@ -1697,8 +1772,10 @@ class SalesForecastWindow(QMainWindow):
         # 显示加载遮罩
         self.loading_overlay.set_text("\u6b63\u5728\u9884\u6d4b\u8ba1\u7b97")
         ch_display = channel if channel else "\u5168\u90e8"
+        start_ym = f"{self.combo_year_start.currentText()}\u5e74{self.combo_month_start.currentText()}"
+        end_ym = f"{self.combo_year_end.currentText()}\u5e74{self.combo_month_end.currentText()}"
         self.loading_overlay.set_sub_text(
-            f"\u7ef4\u5ea6: {dim_label}  |  \u9884\u6d4a\u6708\u6570: {months}\u4e2a\u6708  |  \u6e20\u9053: {ch_display}"
+            f"\u7ef4\u5ea6: {dim_label}  |  \u9884\u6d4b: {start_ym} \u81f3 {end_ym}  |  \u6e20\u9053: {ch_display}"
         )
         self.loading_overlay.set_estimated_time(est_time)
         self.loading_overlay.set_progress(5)
@@ -1859,12 +1936,18 @@ class SalesForecastWindow(QMainWindow):
         self.current_channel = None
 
         self.combo_category.setCurrentIndex(0)
+        # 品类变更后自动触发 _on_category_changed 刷新细分类
         self.combo_subcategory.setCurrentIndex(0)
         self.combo_model.setCurrentText('')
         self.combo_model.lineEdit().setPlaceholderText("\u8f93\u5165/\u9009\u62e9\u578b\u53f7\u5173\u952e\u8bcd...")
 
+        # 重置预测时间到默认
+        if self.combo_year_start.count() > 0:
+            last_idx = self.combo_year_start.count() - 1
+            self.combo_year_start.setCurrentIndex(last_idx)
+            self.combo_year_end.setCurrentIndex(last_idx)
         self.combo_month_start.setCurrentIndex(0)
-        self.combo_month_end.setCurrentIndex(4)  # 默认5月
+        self.combo_month_end.setCurrentIndex(4)
 
         self.table.setColumnCount(0)
         self.table.setRowCount(0)

@@ -1321,7 +1321,7 @@ class SalesForecastWindow(QMainWindow):
 
         # --- 顶部标题区（动态显示当前维度） ---
         header_layout = QHBoxLayout()
-        self.dim_title = QLabel("\U0001f52e \u52a8\u9500\u9884\u6d4a\u7387 \u2014 \u6e20\u9053\u578b\u53f7")
+        self.dim_title = QLabel("\U0001f52e \u52a8\u9500\u9884\u6d4b\u7387 \u2014 \u6e20\u9053\u578b\u53f7")
         self.dim_title.setObjectName("dim_title")
         header_layout.addWidget(self.dim_title)
         header_layout.addStretch()
@@ -1459,27 +1459,28 @@ class SalesForecastWindow(QMainWindow):
         self.loading_overlay = LoadingOverlay(self)
         self.loading_overlay.hide()
 
-    # ========== QComboBox 下拉弹窗去原生黑框 ==========
+    # ========== QComboBox 下拉弹窗样式修复 ==========
     def _fix_combo_popup_frames(self):
-        """移除所有 QComboBox 下拉列表的原生 Windows 黑框"""
+        """设置下拉列表滚动条为浅色主题，与右侧内容区统一"""
+        scrollbar_style = """
+            QScrollBar:vertical {
+                background: #f0f0f0; width: 8px;
+                border: none; border-radius: 4px;
+            }
+            QScrollBar::handle:vertical {
+                background: #c0c0c0; border-radius: 4px; min-height: 20px;
+            }
+            QScrollBar::handle:vertical:hover { background: #a0a0a0; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }
+        """
         combos = [self.combo_category, self.combo_subcategory, self.combo_model,
                   self.combo_month_start, self.combo_month_end]
         for combo in combos:
             view = combo.view()
             if view:
-                view.setFrameShape(QFrame.NoFrame)
-                view.verticalScrollBar().setStyleSheet("""
-                    QScrollBar:vertical {
-                        background: #f0f0f0; width: 8px;
-                        border: none; border-radius: 4px;
-                    }
-                    QScrollBar::handle:vertical {
-                        background: #c0c0c0; border-radius: 4px; min-height: 20px;
-                    }
-                    QScrollBar::handle:vertical:hover { background: #a0a0a0; }
-                    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
-                    QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }
-                """)
+                # 不修改 frame，完全依靠 CSS 控制边框样式
+                view.verticalScrollBar().setStyleSheet(scrollbar_style)
 
     # ========== 初始数据加载 ==========
     def _load_initial_data(self):
@@ -1553,7 +1554,7 @@ class SalesForecastWindow(QMainWindow):
             label = dim_info['label']
 
             # 更新标题
-            self.dim_title.setText(f"\U0001f52e \u52a8\u9500\u9884\u6d4a\u7387 \u2014 {label}")
+            self.dim_title.setText(f"\U0001f52e \u52a8\u9500\u9884\u6d4b\u7387 \u2014 {label}")
 
             # 高亮左侧导航当前项
             # （QListWidget 已自动处理 selected 状态）

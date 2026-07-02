@@ -1738,13 +1738,18 @@ class SalesForecastWindow(QMainWindow):
         return max(1, min(12, int(m.group(1)))) if m else 1
 
     def _parse_ym(self, year_combo, month_combo) -> tuple:
-        """读取年+月，返回 (year, month) 元组"""
-        y = int(year_combo.currentText())
+        """读取年+月，返回 (year, month) 元组（combos 未初始化时返回默认值）"""
+        yt = year_combo.currentText().strip()
+        y = int(yt) if yt else 2026
         m = self._get_month_num(month_combo)
         return y, m
 
     def _on_time_range_changed(self, *args):
         """时间范围联动约束：确保起始 <= 结束"""
+        # 年份控�尚未填充时跳过（初始化阶段）
+        if not self.combo_year_start.currentText().strip():
+            return
+
         sy, sm = self._parse_ym(self.combo_year_start, self.combo_month_start)
         ey, em = self._parse_ym(self.combo_year_end, self.combo_month_end)
 

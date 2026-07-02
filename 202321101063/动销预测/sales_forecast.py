@@ -1098,8 +1098,8 @@ class SalesForecastWindow(QMainWindow):
         model_completer = self.combo_model.completer()
         if model_completer:
             model_completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
-            model_completer.setFilterMode(Qt.MatchFlag.Contains)
-            model_completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+            model_completer.setFilterMode(Qt.MatchContains)
+            model_completer.setCaseSensitivity(Qt.CaseInsensitive)
         filter_layout.addWidget(self.combo_model, 1, 3, 1, 2)
 
         # 第三行：预计月份（起始月 + 结束月）

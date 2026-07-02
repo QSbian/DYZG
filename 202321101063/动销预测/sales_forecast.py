@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-动销预测系统 (Sales Forecast System) v2
+动销预测系统 (Sales Forecast System) v3
 ========================================
 基于 OMS 销售数据库的动销预测工具
 用法：python sales_forecast.py [数据库路径]
@@ -32,6 +32,52 @@ warnings.filterwarnings('ignore', category=FutureWarning)
 
 # 历史记录文件路径（与程序同目录）
 HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.model_history.json')
+DB_HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.db_history.json')
+
+
+# ============================================================
+#  数据库路径管理
+# ============================================================
+
+class DbPathManager:
+    """管理历史数据库路径，支持多路径保存和快速切换"""
+
+    def __init__(self, history_file: str = DB_HISTORY_FILE):
+        self.history_file = history_file
+        self._paths: List[str] = self._load()
+
+    def _load(self) -> List[str]:
+        try:
+            if os.path.exists(self.history_file):
+                with open(self.history_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        return [p for p in data if isinstance(p, str) and os.path.exists(p)]
+        except Exception:
+            pass
+        return []
+
+    def _save(self):
+        try:
+            with open(self.history_file, 'w', encoding='utf-8') as f:
+                json.dump(self._paths, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def add(self, path: str):
+        path = os.path.abspath(path)
+        if path in self._paths:
+            self._paths.remove(path)
+        self._paths.insert(0, path)
+        # 最多保留 10 条
+        self._paths = self._paths[:10]
+        self._save()
+
+    def get_all(self) -> List[str]:
+        return list(self._paths)
+
+    def get_default(self) -> Optional[str]:
+        return self._paths[0] if self._paths else None
 
 
 # ============================================================
@@ -1338,12 +1384,20 @@ class SalesForecastWindow(QMainWindow):
     def __init__(self, db_path: str):
         super().__init__()
         self.db_path = db_path
+        self.db_manager = DbPathManager()
         self.data_loader = DataLoader(db_path)
         self.engine = ForecastEngine(self.data_loader)
         self.current_result_df = None
         self.dimensions_data = {}
         self.worker = None
         self.model_history = ModelHistoryManager()
+        # 数据时间边界（从数据库读取，用于约束预测时间选择）
+        self.data_min_year = 2018
+        self.data_max_year = 2026
+        self.data_min_month = 1
+        self.data_max_month = 12
+        # 所有可用年份列表
+        self.all_years: List[int] = []
         # 当前选中的维度key
         self.current_dimension = 'model'
         # 当前选中的渠道
@@ -1417,6 +1471,25 @@ class SalesForecastWindow(QMainWindow):
         header_layout.addWidget(self.dim_title)
         header_layout.addStretch()
         content_layout.addLayout(header_layout)
+
+        # --- 数据库信息栏 ---
+        db_bar = QWidget()
+        db_bar_layout = QHBoxLayout(db_bar)
+        db_bar_layout.setContentsMargins(0, 0, 0, 0)
+        db_bar_layout.setSpacing(8)
+        db_label = QLabel("数据库:")
+        db_label.setStyleSheet("color: #6c757d; font-weight: bold;")
+        db_bar_layout.addWidget(db_label)
+        self.label_db_path = QLabel(self.db_path)
+        self.label_db_path.setStyleSheet("color: #495057;")
+        self.label_db_path.setWordWrap(True)
+        db_bar_layout.addWidget(self.label_db_path, stretch=1)
+        self.btn_switch_db = QPushButton("更换")
+        self.btn_switch_db.setObjectName("btn_default")
+        self.btn_switch_db.setMaximumWidth(60)
+        self.btn_switch_db.clicked.connect(self._on_switch_db)
+        db_bar_layout.addWidget(self.btn_switch_db)
+        content_layout.addWidget(db_bar)
 
         # --- 筛选区 ---
         filter_box = QGroupBox("\u7b5b\u9009\u6761\u4ef6")
@@ -1604,19 +1677,6 @@ class SalesForecastWindow(QMainWindow):
             models = self.dimensions_data.get('models', [])
             years = self.data_loader.get_years()
 
-            # 年份下拉框（起止共用）
-            year_items = [str(y) for y in years]
-            for combo in (self.combo_year_start, self.combo_year_end):
-                combo.clear()
-                combo.addItems(year_items)
-            if year_items:
-                # 默认起始年 = 最后一个有数据的年份
-                last_year = year_items[-1]
-                self.combo_year_start.setCurrentIndex(len(year_items) - 1)
-                self.combo_year_end.setCurrentIndex(len(year_items) - 1)
-            self.combo_month_start.setCurrentIndex(0)   # 1月
-            self.combo_month_end.setCurrentIndex(4)      # 5月
-
             # 品类
             self.combo_category.blockSignals(True)
             self.combo_category.clear()
@@ -1633,10 +1693,43 @@ class SalesForecastWindow(QMainWindow):
             self._populate_model_combo(models)
 
             period_list = self.dimensions_data.get('periods', [])
+
+            # ---- 设置数据时间边界 ----
             if period_list:
+                first = period_list[0]
+                last = period_list[-1]
+                self.data_min_year = int(first[:4])
+                self.data_max_year = int(last[:4])
+                self.data_min_month = int(first[4:6])
+                self.data_max_month = int(last[4:6])
                 self.statusBar().showMessage(
                     f"\u6570\u636e\u52a0\u8f7e\u5b8c\u6210 | \u8d26\u671f\u8303\u56f4: {period_list[0]} ~ {period_list[-1]}"
                 )
+            else:
+                self.data_min_year = 2018; self.data_max_year = 2026
+                self.data_min_month = 1; self.data_max_month = 12
+
+            # ---- 更新预测时间选择器 ----
+            self.all_years = years
+            self.combo_year_start.blockSignals(True)
+            self.combo_year_end.blockSignals(True)
+            self.combo_year_start.clear()
+            self.combo_year_end.clear()
+            year_items = [str(y) for y in years]
+            self.combo_year_start.addItems(year_items)
+            self.combo_year_end.addItems(year_items)
+            # 默认选中最后一个有数据的年份
+            if year_items:
+                last_idx = len(year_items) - 1
+                self.combo_year_start.setCurrentIndex(last_idx)
+                self.combo_year_end.setCurrentIndex(last_idx)
+            self.combo_month_start.setCurrentIndex(0)   # 1月
+            self.combo_month_end.setCurrentIndex(self.data_max_month - 1)  # 最后一个数据月
+            self.combo_year_start.blockSignals(False)
+            self.combo_year_end.blockSignals(False)
+
+            # 初始过滤时间显示范围
+            self._filter_time_combos()
         except Exception as e:
             self.statusBar().showMessage(f"\u6570\u636e\u52a0\u8f7d\u5931\u8d25: {e}")
             QMessageBox.critical(self, "\u9519\u8bef", f"\u65e0\u6cd5\u52a0\u8f7d\u6570\u636e\u5e93:\n{e}")
@@ -1660,6 +1753,38 @@ class SalesForecastWindow(QMainWindow):
             if m not in added:
                 self.combo_model.addItem(m)
                 added.add(m)
+
+    # ========== 数据库切换 ==========
+    def _on_switch_db(self):
+        """切换数据库"""
+        history = self.db_manager.get_all()
+        # 构建历史列表菜单
+        menu_items = []
+        for p in history:
+            menu_items.append((p, p == self.db_path))
+
+        # 使用 QFileDialog 选择新路径
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择数据库文件",
+            os.path.dirname(self.db_path),
+            "SQLite 数据库 (*.sqlite *.db);;所有文件 (*)",
+        )
+        if not path or not os.path.exists(path):
+            return
+
+        self._reload_with_db(path)
+
+    def _reload_with_db(self, new_db_path: str):
+        """用新数据库路径重新加载整个应用"""
+        self.db_manager.add(new_db_path)
+        self.db_path = new_db_path
+        self.label_db_path.setText(new_db_path)
+        self.data_loader = DataLoader(new_db_path)
+        self.engine = ForecastEngine(self.data_loader)
+        self.current_result_df = None
+        self._load_initial_data()
+        self.table.setColumnCount(0)
+        self.table.setRowCount(0)
 
     # ========== 导航/维度切换 ==========
     def _on_nav_clicked(self, item):
@@ -1745,27 +1870,74 @@ class SalesForecastWindow(QMainWindow):
         return y, m
 
     def _on_time_range_changed(self, *args):
-        """时间范围联动约束：确保起始 <= 结束"""
-        # 年份控�尚未填充时跳过（初始化阶段）
+        """时间范围变化时更新过滤和约束"""
+        # 年份控件尚未填充时跳过
         if not self.combo_year_start.currentText().strip():
             return
+        self._filter_time_combos()
 
-        sy, sm = self._parse_ym(self.combo_year_start, self.combo_month_start)
-        ey, em = self._parse_ym(self.combo_year_end, self.combo_month_end)
+    def _filter_time_combos(self):
+        """根据当前选择和数据边界，动态过滤年/月下拉列表"""
+        # 保存当前选择
+        sel_start_y = self.combo_year_start.currentText().strip()
+        sel_start_m = self.combo_month_start.currentIndex()
+        sel_end_y = self.combo_year_end.currentText().strip()
+        sel_end_m = self.combo_month_end.currentIndex()
 
-        start_val = sy * 100 + sm
-        end_val = ey * 100 + em
+        sy = int(sel_start_y) if sel_start_y else self.data_max_year
 
-        if start_val > end_val:
-            # 起始时间超过结束时间，修正结束时间到相同值
-            self.combo_year_end.blockSignals(True)
-            self.combo_month_end.blockSignals(True)
-            idx_y = self.combo_year_end.findText(str(sy))
-            if idx_y >= 0:
-                self.combo_year_end.setCurrentIndex(idx_y)
-            self.combo_month_end.setCurrentIndex(sm - 1)
-            self.combo_month_end.blockSignals(False)
-            self.combo_year_end.blockSignals(False)
+        self.combo_year_start.blockSignals(True)
+        self.combo_month_start.blockSignals(True)
+        self.combo_year_end.blockSignals(True)
+        self.combo_month_end.blockSignals(True)
+
+        # ---- 起始年 ----
+        self.combo_year_start.clear()
+        self.combo_year_start.addItems([str(y) for y in self.all_years])
+
+        # ---- 起始月（受数据边界约束） ----
+        self.combo_month_start.clear()
+        sm_min = self.data_min_month if sy <= self.data_min_year else 1
+        sm_max = self.data_max_month if sy >= self.data_max_year else 12
+        for m in range(sm_min, sm_max + 1):
+            self.combo_month_start.addItem(f"{m}\u6708")
+        if 0 <= sel_start_m < self.combo_month_start.count():
+            self.combo_month_start.setCurrentIndex(sel_start_m)
+        else:
+            self.combo_month_start.setCurrentIndex(0)
+
+        # ---- 结束年（>= 起始年） ----
+        self.combo_year_end.clear()
+        self.combo_year_end.addItems([str(y) for y in self.all_years if y >= sy])
+
+        # ---- 结束月（受数据边界 + 起始时间约束） ----
+        end_y_text = self.combo_year_end.currentText().strip()
+        ey = int(end_y_text) if end_y_text else sy
+        self.combo_month_end.clear()
+        em_min = self.data_min_month if ey <= self.data_min_year else 1
+        em_max = self.data_max_month if ey >= self.data_max_year else 12
+        sm_now = self.combo_month_start.currentIndex() + sm_min
+        if sy == ey:
+            em_min = max(em_min, sm_now)
+        for m in range(em_min, em_max + 1):
+            self.combo_month_end.addItem(f"{m}\u6708")
+        if 0 <= sel_end_m < self.combo_month_end.count():
+            self.combo_month_end.setCurrentIndex(sel_end_m)
+        else:
+            self.combo_month_end.setCurrentIndex(self.combo_month_end.count() - 1)
+
+        # 恢复年份选择
+        idx_sy = self.combo_year_start.findText(sel_start_y)
+        if idx_sy >= 0:
+            self.combo_year_start.setCurrentIndex(idx_sy)
+        idx_ey = self.combo_year_end.findText(sel_end_y)
+        if idx_ey >= 0:
+            self.combo_year_end.setCurrentIndex(idx_ey)
+
+        self.combo_year_start.blockSignals(False)
+        self.combo_month_start.blockSignals(False)
+        self.combo_year_end.blockSignals(False)
+        self.combo_month_end.blockSignals(False)
 
     def _get_forecast_months(self) -> int:
         """根据起止年/月计算预测月数"""
@@ -2031,10 +2203,18 @@ class SalesForecastWindow(QMainWindow):
 # ============================================================
 
 def find_db_path():
-    """查找数据库文件"""
+    """查找数据库文件（命令行参数 → 历史记录 → 候选路径）"""
+    # 命令行参数优先
     if len(sys.argv) > 1 and os.path.exists(sys.argv[1]):
         return sys.argv[1]
 
+    # 历史记录
+    mgr = DbPathManager()
+    default = mgr.get_default()
+    if default and os.path.exists(default):
+        return default
+
+    # 候选路径
     candidates = [
         r"C:\Users\cheng\Desktop\作业文件夹\实习\oms_sales_data.sqlite",
         os.path.join(os.path.dirname(__file__), '..', '\u4efb\u52a1\u4e94', 'oms_sales_data.sqlite'),
@@ -2048,15 +2228,62 @@ def find_db_path():
 
 
 def main():
+    # ---- 启动时提示用户选择 / 输入数据库路径 ----
+    mgr = DbPathManager()
     db_path = find_db_path()
-    if not db_path:
-        print("[\u9519\u8bef] \u672a\u627e\u5230\u6570\u636e\u5e93\u6587\u4ef6 oms_sales_data.sqlite")
-        print("\u7528\u6cd5: python sales_forecast.py [\u6570\u636e\u5e93\u8def\u5f84]")
-        print("      \u6216\u786e\u4fdd ../任务五/oms_sales_data.sqlite \u5b58\u5728")
-        input("\u6309\u56de\u8f66\u9000\u51fa...")
+    history = mgr.get_all()
+
+    print("=" * 55)
+    print("       动销预测系统 v3")
+    print("=" * 55)
+    print()
+
+    if history:
+        print("历史数据库路径：")
+        for i, p in enumerate(history, 1):
+            marker = "  ← 默认" if i == 1 else ""
+            print(f"  [{i}] {p}{marker}")
+
+    show_default = db_path and os.path.exists(db_path)
+    if show_default:
+        print(f"\n默认使用：{db_path}")
+        print("直接回车使用默认，输入数字选择历史路径，或输入新路径：")
+    else:
+        print("\n请拖入或输入数据库文件路径：")
+
+    try:
+        user_input = input("> ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\n已取消。")
         sys.exit(1)
 
-    print(f"[\u4fe1\u606f] \u4f7f\u7528\u6570\u636e\u5e93: {db_path}")
+    if user_input == '':
+        # 使用默认
+        if not show_default:
+            print("[错误] 未指定数据库路径，退出。")
+            sys.exit(1)
+    elif user_input.isdigit():
+        idx = int(user_input) - 1
+        if 0 <= idx < len(history):
+            db_path = history[idx]
+        else:
+            print(f"[错误] 无效编号: {user_input}")
+            sys.exit(1)
+    else:
+        # 用户手动输入的路径
+        if os.path.exists(user_input):
+            db_path = user_input
+        else:
+            print(f"[错误] 文件不存在: {user_input}")
+            sys.exit(1)
+
+    if not db_path or not os.path.exists(db_path):
+        print("[错误] 未找到有效的数据库文件。")
+        sys.exit(1)
+
+    # 保存到历史记录
+    mgr.add(db_path)
+    print(f"\n[信息] 使用数据库: {db_path}")
 
     if not HAS_PYSIDE6:
         print("\n" + "=" * 54)
@@ -2078,9 +2305,7 @@ def main():
             pip_cmd = [sys.executable, "-m", "pip", "install", "PySide6",
                         "-i", "https://pypi.tuna.tsinghua.edu.cn/simple"]
             print("\n[信息] 正在安装 PySide6，请稍候...\n")
-            ret = subprocess.run(pip_cmd, check=False)
-
-            # 真正验证安装是否可用（而不仅仅看 pip 返回码）
+            subprocess.run(pip_cmd, check=False)
             py_cp = subprocess.run(
                 [sys.executable, "-c", "import PySide6; print('PySide6', PySide6.__version__)"],
                 capture_output=True, text=True, check=False
@@ -2090,14 +2315,10 @@ def main():
                 print(f"\n[成功] PySide6 安装完成（版本 {ver}）！请重新运行本程序。")
             else:
                 print("\n[错误] pip 安装成功，但 import PySide6 仍失败。")
-                print("可能原因：pip 安装到了其他 Python 环境。")
                 print("请在 VS Code 终端手动执行以下命令：")
                 print(f'  "{sys.executable}" -m pip install PySide6')
-                print("安装完成后，在 VS Code 终端运行以下命令验证：")
-                print(f'  "{sys.executable}" -c "import PySide6; print(PySide6.__version__)"')
         else:
             print("\n[信息] 已退出。")
-
         input("\n按回车退出...")
         sys.exit(1)
 

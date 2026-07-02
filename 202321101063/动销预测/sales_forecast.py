@@ -1431,27 +1431,24 @@ class SalesForecastWindow(QMainWindow):
     # 渠道按钮选项
     CHANNEL_OPTIONS = ['线上和线下', '线上', '线下']
 
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: Optional[str] = None):
         super().__init__()
-        self.db_path = db_path
+        self.db_path = db_path or ''
         self.db_manager = DbPathManager()
-        self.data_loader = DataLoader(db_path)
-        self.engine = ForecastEngine(self.data_loader)
+        self.data_loader = None
+        self.engine = None
         self.current_result_df = None
         self.dimensions_data = {}
         self.worker = None
         self.model_history = ModelHistoryManager()
-        # 数据时间边界（从数据库读取，用于约束预测时间选择）
+        # 数据时间边界
         self.data_min_year = 2018
         self.data_max_year = 2026
         self.data_min_month = 1
         self.data_max_month = 12
-        # 所有可用年份列表
         self.all_years: List[int] = []
-        # 当前选中的维度key
         self.current_dimension = 'model'
-        # 当前选中的渠道
-        self.current_channel = None  # None 表示"线上和线下"
+        self.current_channel = None
         self.setWindowTitle("动销预测系统 — DYZG OMS")
         self.setMinimumSize(1200, 750)
         self.resize(1400, 850)
@@ -1459,7 +1456,13 @@ class SalesForecastWindow(QMainWindow):
 
         self._setup_ui()
         self._fix_combo_popup_frames()
-        self._load_initial_data()
+
+        # 有有效数据库则加载，否则显示占位提示
+        if self.db_path and os.path.exists(self.db_path):
+            self._init_with_db()
+        else:
+            self.label_db_path.setText("（请选择数据库文件）")
+            self.statusBar().showMessage("就绪 — 请点击「更换」选择数据库文件")
 
     # ========== UI 搭建 ==========
     def _setup_ui(self):
@@ -1805,34 +1808,48 @@ class SalesForecastWindow(QMainWindow):
                 added.add(m)
 
     # ========== 数据库切换 ==========
+    def _init_with_db(self):
+        """用当前 db_path 初始化数据引擎"""
+        if not self.db_path or not os.path.exists(self.db_path):
+            return
+        self.db_manager.add(self.db_path)
+        self.data_loader = DataLoader(self.db_path)
+        self.engine = ForecastEngine(self.data_loader)
+        self.label_db_path.setText(self.db_path)
+        self._load_initial_data()
+
+    def prompt_select_database(self):
+        """弹出文件对话框让用户选择数据库（UI 启动后调用）"""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择 OMS 销售数据库",
+            os.path.expanduser("~"),
+            "SQLite 数据库 (*.sqlite *.db);;所有文件 (*)",
+        )
+        if path and os.path.exists(path):
+            self.db_path = path
+            self._init_with_db()
+        else:
+            self.statusBar().showMessage("未选择数据库，请点击「更换」按钮加载数据")
+
     def _on_switch_db(self):
         """切换数据库"""
-        history = self.db_manager.get_all()
-        # 构建历史列表菜单
-        menu_items = []
-        for p in history:
-            menu_items.append((p, p == self.db_path))
-
-        # 使用 QFileDialog 选择新路径
         path, _ = QFileDialog.getOpenFileName(
             self, "选择数据库文件",
-            os.path.dirname(self.db_path),
+            os.path.dirname(self.db_path) if self.db_path else os.path.expanduser("~"),
             "SQLite 数据库 (*.sqlite *.db);;所有文件 (*)",
         )
         if not path or not os.path.exists(path):
             return
 
-        self._reload_with_db(path)
+        self.db_path = path
+        self._init_with_db()
+        self.table.setColumnCount(0)
+        self.table.setRowCount(0)
 
     def _reload_with_db(self, new_db_path: str):
         """用新数据库路径重新加载整个应用"""
-        self.db_manager.add(new_db_path)
         self.db_path = new_db_path
-        self.label_db_path.setText(new_db_path)
-        self.data_loader = DataLoader(new_db_path)
-        self.engine = ForecastEngine(self.data_loader)
-        self.current_result_df = None
-        self._load_initial_data()
+        self._init_with_db()
         self.table.setColumnCount(0)
         self.table.setRowCount(0)
 
@@ -1898,6 +1915,8 @@ class SalesForecastWindow(QMainWindow):
     # ========== 品类-细分类联动 ==========
     def _on_category_changed(self, text: str):
         """当品类选择变化时，更新细分类下拉列表"""
+        if not self.data_loader:
+            return
         self.combo_subcategory.blockSignals(True)
         self.combo_subcategory.clear()
         self.combo_subcategory.addItem('全部')
@@ -2003,6 +2022,11 @@ class SalesForecastWindow(QMainWindow):
         if self.worker and self.worker.isRunning():
             self.worker.cancel()
             self.worker.wait(1000)
+
+        if not self.engine or not self.data_loader:
+            QMessageBox.warning(self, "\u63d0\u793a", "\u8bf7\u5148\u9009\u62e9\u6570\u636e\u5e93\u6587\u4ef6")
+            self.prompt_select_database()
+            return
 
         if not self.current_dimension:
             QMessageBox.information(self, "\u63d0\u793a", "\u8bf7\u5148\u5728\u5de6\u4fa7\u5bfc\u822a\u680f\u9009\u62e9\u4e00\u4e2a\u9884\u6d4a\u7ef4\u5ea6")
@@ -2250,10 +2274,14 @@ class SalesForecastWindow(QMainWindow):
             self.worker.quit()
             self.worker.wait(3000)
         # 关闭前保存当前型号输入到历史
-        current_model = self.combo_model.currentText().strip()
-        if current_model:
-            self.model_history.add(current_model)
-        self.data_loader.close()
+        try:
+            current_model = self.combo_model.currentText().strip()
+            if current_model:
+                self.model_history.add(current_model)
+        except Exception:
+            pass
+        if self.data_loader:
+            self.data_loader.close()
         super().closeEvent(event)
 
 
@@ -2261,131 +2289,28 @@ class SalesForecastWindow(QMainWindow):
 #  入口
 # ============================================================
 
-def find_db_path():
-    """查找数据库文件（命令行参数 → 历史记录 → 候选路径）"""
-    # 命令行参数优先
-    if len(sys.argv) > 1 and os.path.exists(sys.argv[1]):
-        return sys.argv[1]
-
-    # 历史记录
-    mgr = DbPathManager()
-    default = mgr.get_default()
-    if default and os.path.exists(default):
-        return default
-
-    # 候选路径
-    candidates = [
-        r"C:\Users\cheng\Desktop\作业文件夹\实习\oms_sales_data.sqlite",
-        os.path.join(os.path.dirname(__file__), '..', '\u4efb\u52a1\u4e94', 'oms_sales_data.sqlite'),
-        r"C:\Users\cheng\Desktop\作业文件夹\实习\cangku\202321101063\任务五\oms_sales_data.sqlite",
-        os.path.join(os.path.dirname(__file__), 'oms_sales_data.sqlite'),
-    ]
-    for c in candidates:
-        if os.path.exists(c):
-            return c
-    return None
-
-
 def main():
-    # ---- 启动时提示用户选择 / 输入数据库路径 ----
-    mgr = DbPathManager()
-    db_path = find_db_path()
-    history = mgr.get_all()
-
-    print("=" * 55)
-    print("       动销预测系统 v3")
-    print("=" * 55)
-    print()
-
-    if history:
-        print("历史数据库路径：")
-        for i, p in enumerate(history, 1):
-            marker = "  ← 默认" if i == 1 else ""
-            print(f"  [{i}] {p}{marker}")
-
-    show_default = db_path and os.path.exists(db_path)
-    if show_default:
-        print(f"\n默认使用：{db_path}")
-        print("直接回车使用默认，输入数字选择历史路径，或输入新路径：")
-    else:
-        print("\n请拖入或输入数据库文件路径：")
-
-    try:
-        user_input = input("> ").strip()
-    except (EOFError, KeyboardInterrupt):
-        print("\n已取消。")
-        sys.exit(1)
-
-    if user_input == '':
-        # 使用默认
-        if not show_default:
-            print("[错误] 未指定数据库路径，退出。")
-            sys.exit(1)
-    elif user_input.isdigit():
-        idx = int(user_input) - 1
-        if 0 <= idx < len(history):
-            db_path = history[idx]
-        else:
-            print(f"[错误] 无效编号: {user_input}")
-            sys.exit(1)
-    else:
-        # 用户手动输入的路径
-        if os.path.exists(user_input):
-            db_path = user_input
-        else:
-            print(f"[错误] 文件不存在: {user_input}")
-            sys.exit(1)
-
-    if not db_path or not os.path.exists(db_path):
-        print("[错误] 未找到有效的数据库文件。")
-        sys.exit(1)
-
-    # 保存到历史记录
-    mgr.add(db_path)
-    print(f"\n[信息] 使用数据库: {db_path}")
-
-    if not HAS_PYSIDE6:
-        print("\n" + "=" * 54)
-        print("[提示] 未检测到 PySide6，无法启动图形界面。")
-        print("=" * 54)
-        print()
-        print("  1. 安装 PySide6（需要联网，约 60~100 MB）")
-        print("  2. 退出（直接回车）")
-        print()
-
-        try:
-            choice = input("请选择 (输入 1 或直接回车退出): ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\n已取消。")
-            sys.exit(1)
-
-        if choice == '1':
-            import subprocess
-            pip_cmd = [sys.executable, "-m", "pip", "install", "PySide6",
-                        "-i", "https://pypi.tuna.tsinghua.edu.cn/simple"]
-            print("\n[信息] 正在安装 PySide6，请稍候...\n")
-            subprocess.run(pip_cmd, check=False)
-            py_cp = subprocess.run(
-                [sys.executable, "-c", "import PySide6; print('PySide6', PySide6.__version__)"],
-                capture_output=True, text=True, check=False
-            )
-            if py_cp.returncode == 0:
-                ver = py_cp.stdout.strip().replace("PySide6 ", "")
-                print(f"\n[成功] PySide6 安装完成（版本 {ver}）！请重新运行本程序。")
-            else:
-                print("\n[错误] pip 安装成功，但 import PySide6 仍失败。")
-                print("请在 VS Code 终端手动执行以下命令：")
-                print(f'  "{sys.executable}" -m pip install PySide6')
-        else:
-            print("\n[信息] 已退出。")
-        input("\n按回车退出...")
-        sys.exit(1)
-
-
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
+
+    # 命令行参数优先
+    db_path = None
+    if len(sys.argv) > 1 and os.path.exists(sys.argv[1]):
+        db_path = sys.argv[1]
+    else:
+        # 尝试历史记录
+        mgr = DbPathManager()
+        default = mgr.get_default()
+        if default and os.path.exists(default):
+            db_path = default
+
     window = SalesForecastWindow(db_path)
     window.show()
+
+    # 如果没有有效数据库，启动后立即弹出选择对话框
+    if not db_path or not os.path.exists(db_path):
+        window.prompt_select_database()
+
     sys.exit(app.exec())
 
 

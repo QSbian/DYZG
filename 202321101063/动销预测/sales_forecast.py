@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-动销预测系统 (Sales Forecast System)
-=====================================
+动销预测系统 (Sales Forecast System) v2
+========================================
 基于 OMS 销售数据库的动销预测工具
-支持三大预测维度：渠道大类 / 渠道细分类 / 渠道型号
-支持多种预测算法：Naive / SMA / Median / HW(指数平滑) / RF(随机森林) / Croston
+
+v2 改动：
+- 预测维度移至左侧导航栏，点击切换
+- 渠道筛选改为三按钮（线上 / 线下 / 线上和线下）
+- 型号支持输入 + 下拉选择 + 历史记录
+- 预计月份支持单月或月份区间
+- 加载动画显示预计耗时
 
 用法：python sales_forecast.py [数据库路径]
 默认数据库路径：../任务五/oms_sales_data.sqlite
@@ -15,6 +20,7 @@ import os
 import sys
 import sqlite3
 import csv
+import json
 import warnings
 from datetime import datetime
 from collections import OrderedDict
@@ -31,13 +37,17 @@ if sys.platform == 'win32':
 
 warnings.filterwarnings('ignore', category=FutureWarning)
 
+# 历史记录文件路径（与程序同目录）
+HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.model_history.json')
+
+
 # ============================================================
 #  数据加载模块
 # ============================================================
 
 class DataLoader:
     """从 SQLite 加载动销数据，不修改原始数据库。
-    
+
     线程安全：每次查询都创建独立的连接，避免跨线程共享连接报错。
     """
 
@@ -49,11 +59,10 @@ class DataLoader:
         return sqlite3.connect(self.db_path)
 
     def connect(self):
-        # 兼容旧接口，返回新连接（调用方需自行关闭）
         return self._new_conn()
 
     def close(self):
-        pass  # 不再持有持久连接，无需关闭
+        pass
 
     def load_raw_data(self) -> pd.DataFrame:
         """读取 vw_product_sales_customer_3 视图的动销数据"""
@@ -71,7 +80,6 @@ class DataLoader:
                 ORDER BY 账期
             """
             df = pd.read_sql_query(query, conn)
-            # 确保数值类型
             df['sales_qty'] = pd.to_numeric(df['sales_qty'], errors='coerce').fillna(0)
             return df
         finally:
@@ -118,11 +126,6 @@ class BasePredictor:
     name = "Base"
 
     def fit_predict(self, series: np.ndarray, forecast_horizon: int = 5) -> Tuple[np.ndarray, float]:
-        """
-        拟合并预测
-        返回: (预测值数组, 准确率)
-        准确率基于最后一段历史数据的拟合误差计算
-        """
         raise NotImplementedError
 
 
@@ -135,7 +138,6 @@ class NaivePredictor(BasePredictor):
             return np.zeros(forecast_horizon), 0.0
         last_val = series[-1]
         forecast = np.full(forecast_horizon, last_val)
-        # 用最近 6 期的 MAPE 评估
         accuracy = self._calc_accuracy(series, forecast_horizon)
         return forecast, accuracy
 
@@ -153,7 +155,7 @@ class NaivePredictor(BasePredictor):
 class SMAPredictor(BasePredictor):
     """简单移动平均（SMA）"""
     name = "SMA"
-    window = 3  # 默认窗口
+    window = 3
 
     def fit_predict(self, series: np.ndarray, forecast_horizon: int = 5) -> Tuple[np.ndarray, float]:
         if len(series) == 0:
@@ -213,11 +215,9 @@ class HWPredictor(BasePredictor):
 
         s = series.astype(float)
         try:
-            # 尝试加法模型
             model = ExponentialSmoothing(s, trend='add', seasonal=None,
                                           initialization_method='estimated').fit()
             forecast = model.forecast(forecast_horizon).values
-            # 计算拟合精度
             fitted = model.fittedvalues.values
             if len(fitted) >= 4:
                 actual_tail = s[-min(len(fitted), 12):]
@@ -243,7 +243,6 @@ class RFPredictor(BasePredictor):
             return SMAPredictor().fit_predict(series, forecast_horizon)
 
         s = series.astype(float).flatten()
-        # 特征工程：用滑动窗口构造特征
         window_size = min(6, n // 3)
         X, y = [], []
         for i in range(window_size, n):
@@ -251,7 +250,6 @@ class RFPredictor(BasePredictor):
             y.append(s[i])
         X, y = np.array(X), np.array(y)
 
-        # 留出测试集评估准确率
         split = int(len(X) * 0.75)
         X_train, X_test = X[:split], X[split:]
         y_train, y_test = y[:split], y[split:]
@@ -259,7 +257,6 @@ class RFPredictor(BasePredictor):
         rf = RandomForestRegressor(n_estimators=50, max_depth=5, random_state=42, n_jobs=-1)
         rf.fit(X_train, y_train)
 
-        # 计算准确率
         if len(y_test) > 0:
             y_pred = rf.predict(X_test)
             mape = np.mean(np.abs((y_test - y_pred + 1e-9) / (y_test + 1e-9)))
@@ -267,7 +264,6 @@ class RFPredictor(BasePredictor):
         else:
             accuracy = 80.0
 
-        # 预测未来
         future_X = []
         recent = list(s[-window_size:])
         for _ in range(forecast_horizon):
@@ -285,19 +281,13 @@ class CrostonPredictor(BasePredictor):
     name = "Croston"
 
     def fit_predict(self, series: np.ndarray, forecast_horizon: int = 5) -> Tuple[np.ndarray, float]:
-        """
-        Croston 经典实现：
-        分别对非零需求间隔和需求量做指数平滑
-        """
         s = series.astype(float).flatten()
         n = len(s)
         if n < 4:
             return SMAPredictor().fit_predict(series, forecast_horizon)
 
-        # 提取非零点
         nonzero_idx = np.where(s > 0)[0]
         if len(nonzero_idx) < 2:
-            # 全是零或只有一个非零点
             val = s[nonzero_idx[0]] if len(nonzero_idx) > 0 else 0
             return np.full(forecast_horizon, val), 70.0
 
@@ -305,14 +295,12 @@ class CrostonPredictor(BasePredictor):
         intervals = np.diff(nonzero_idx, prepend=-1)
         intervals[intervals == 0] = 1
 
-        alpha = 0.1  # 平滑系数
+        alpha = 0.1
 
-        # 对需求量做简单指数平滑
         level_q = demands[0]
         for d in demands[1:]:
             level_q = alpha * d + (1 - alpha) * level_q
 
-        # 对间隔做简单指数平滑
         level_p = intervals[0]
         for p in intervals[1:]:
             level_p = alpha * p + (1 - alpha) * level_p
@@ -320,8 +308,7 @@ class CrostonPredictor(BasePredictor):
         forecast_val = level_q / max(level_p, 1)
         forecast = np.full(forecast_horizon, max(0, forecast_val))
 
-        # 评估：对最近非零段拟合
-        accuracy = 90.0  # Croston 难以精确评估，给一个合理默认值
+        accuracy = 90.0
         if len(nonzero_idx) >= 6:
             test_nz = nonzero_idx[-min(6, len(nonzero_idx)):]
             actual_part = s[test_nz[0]:]
@@ -349,7 +336,6 @@ class ForecastEngine:
         NaivePredictor(),
     ]
 
-    # 维度映射：维度名 → (groupby 字段列表, 显示名)
     DIMENSIONS = {
         'model': {
             'groupby': ['channel', 'category', 'subcategory', 'model'],
@@ -364,6 +350,9 @@ class ForecastEngine:
             'label': '渠道大类',
         },
     }
+
+    # 维度显示顺序（对应左侧导航栏）
+    DIM_ORDER = ['model', 'subcategory', 'category']
 
     def __init__(self, data_loader: DataLoader):
         self.loader = data_loader
@@ -384,24 +373,6 @@ class ForecastEngine:
         filter_model: Optional[str] = None,
         algorithm_filter: Optional[List[str]] = None,
     ) -> pd.DataFrame:
-        """
-        执行预测主流程
-
-        Parameters
-        ----------
-        dimension : str
-            'model'(渠道型号) / 'subcategory'(渠道细分类) / 'category'(渠道大类)
-        forecast_months : int
-            向前预测几个月
-        filter_* : str or None
-            各维度的筛选条件
-        algorithm_filter : list of str or None
-            只使用指定的算法，如 ['RF','HW']
-
-        Returns
-        -------
-        DataFrame : 预测结果表
-        """
         if self.raw_df is None:
             self.load_data()
 
@@ -410,14 +381,20 @@ class ForecastEngine:
         groupby_cols = dim_info['groupby']
 
         # ---- 应用筛选 ----
-        if filter_channel and filter_channel != '全部':
-            df = df[df['channel'] == filter_channel]
+        # filter_channel 现在可能是 '线上'/'线下'/'线上和线下'/None
+        if filter_channel:
+            if filter_channel == '线上':
+                df = df[df['channel'] == '线上']
+            elif filter_channel == '线下':
+                df = df[df['channel'] == '线下']
+            # '线上和线下' 不做过滤（保留全部）
+
         if filter_category and filter_category != '全部':
             df = df[df['category'] == filter_category]
         if filter_subcategory and filter_subcategory not in ('全部', None, ''):
             df = df[df['subcategory'] == filter_subcategory]
         if filter_model and filter_model not in ('全部', None, ''):
-            df = df[df['model'] == filter_model]
+            df = df[df['model'].str.contains(filter_model, na=False)]
 
         # ---- 构建时间序列透视表 ----
         pivot = df.pivot_table(
@@ -442,7 +419,6 @@ class ForecastEngine:
         predictors = list(self.PREDICTORS)
         if algorithm_filter:
             predictors = [p for p in predictors if p.name in algorithm_filter]
-        # 渠道型号维度数据量大时，去掉最慢的 RF 和 HW
         if dimension == 'model' and n_groups > 200 and not algorithm_filter:
             predictors = [p for p in predictors if p.name not in ('RF', 'HW')]
         elif dimension == 'subcategory' and n_groups > 100 and not algorithm_filter:
@@ -458,11 +434,10 @@ class ForecastEngine:
 
         # ---- 并行执行预测 ----
         results = []
-        max_workers = min(8, os.cpu_count() or 4)  # 最多8线程
+        max_workers = min(8, os.cpu_count() or 4)
         completed = 0
         total_tasks = len(tasks)
 
-        # 小数据量直接串行（避免线程开销）
         if total_tasks <= 30 or max_workers <= 1:
             for i, (idx, series_values) in enumerate(tasks):
                 result = self._predict_one_group(
@@ -473,7 +448,6 @@ class ForecastEngine:
                     results.append(result)
                 completed += 1
         else:
-            # 大数据量并行
             def _task_fn(args):
                 idx, sv = args
                 return self._predict_one_group(
@@ -498,7 +472,7 @@ class ForecastEngine:
         result_df = pd.DataFrame(results)
 
         # 添加合计行
-        total_row = OrderedDict([('渠道', '合计'), ('型号', ''), ('细分类', ''), ('预测算法', ''), ('准确率', '')])
+        total_row = OrderedDict([('渠道', ''), ('型号', ''), ('细分类', ''), ('预测算法', ''), ('准确率', '')])
         numeric_cols = [c for c in result_df.columns if c not in ['渠道', '型号', '细分类', '预测算法', '准确率']]
         for col in numeric_cols:
             total_row[col] = int(result_df[col].sum()) if result_df[col].dtype.kind in 'iuf' else round(result_df[col].sum(), 1)
@@ -507,6 +481,52 @@ class ForecastEngine:
 
         self.result_df = result_df
         return result_df
+
+    def estimate_time(self, dimension: str, filter_channel: Optional[str] = None,
+                      filter_model: Optional[str] = None) -> float:
+        """
+        快速估算预测所需时间（秒），用于加载动画展示。
+        通过快速查询分组数来估算。
+        """
+        if self.raw_df is None:
+            try:
+                self.load_data()
+            except Exception:
+                return 10.0
+
+        df = self.raw_df.copy()
+        dim_info = self.DIMENSIONS.get(dimension, self.DIMENSIONS['model'])
+        groupby_cols = dim_info['groupby']
+
+        # 应用同样的筛选逻辑
+        if filter_channel:
+            if filter_channel == '线上':
+                df = df[df['channel'] == '线上']
+            elif filter_channel == '线下':
+                df = df[df['channel'] == '线下']
+
+        if filter_model and filter_model not in ('全部', None, ''):
+            df = df[df['model'].str.contains(filter_model, na=False)]
+
+        try:
+            n_groups = df.groupby(groupby_cols).ngroups
+        except Exception:
+            n_groups = 500
+
+        # 经验公式：基础时间 + 每组耗时 * 分组数 / 并行度
+        base = 1.5
+        per_group = 0.08 if dimension == 'model' else (0.15 if dimension == 'subcategory' else 0.25)
+        parallel_factor = min(8, os.cpu_count() or 4)
+
+        estimated = base + (n_groups * per_group / parallel_factor)
+
+        # 根据维度调整系数
+        if dimension == 'model':
+            estimated *= 1.2  # 型号维度数据量大
+        elif dimension == 'category':
+            estimated *= 0.6  # 大类维度快一些
+
+        return round(max(2.0, min(estimated, 120.0)), 1)
 
     def _predict_one_group(self, idx, series_values, predictors, forecast_months, pivot, target_periods):
         """对单个分组执行预测（可被并行调用）"""
@@ -527,7 +547,6 @@ class ForecastEngine:
         if best_forecast is None:
             return None
 
-        # 构造结果行
         result_row = OrderedDict([
             ('渠道', idx[0]),
             ('型号', idx[3] if len(idx) > 3 else ''),
@@ -536,12 +555,10 @@ class ForecastEngine:
             ('准确率', round(best_acc, 2)),
         ])
 
-        # 历史实际值（取最后几期用于对比）
         hist_cols = list(pivot.columns)[-forecast_months:] if len(pivot.columns) >= forecast_months else list(pivot.columns)
         for hc in hist_cols:
             result_row[hc] = int(pivot.loc[idx, hc])
 
-        # 预测值
         for tp, fv in zip(target_periods, best_forecast):
             result_row[tp] = round(float(fv), 1)
 
@@ -573,9 +590,9 @@ try:
         QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox,
         QSplitter, QGroupBox, QListWidget, QListWidgetItem, QProgressBar, QFileDialog,
         QCheckBox, QSpinBox, QDialog, QDialogButtonBox, QAbstractItemView,
-        QSizePolicy,
+        QSizePolicy, QButtonGroup, QRadioButton,
     )
-    from PySide6.QtCore import Qt, QTimer, Signal, QThread, QObject, QPropertyAnimation, QEasingCurve, QParallelAnimationGroup
+    from PySide6.QtCore import Qt, QTimer, Signal, QThread, QObject, QPropertyAnimation, QEasingCurve, QCompleter
     from PySide6.QtGui import QFont, QColor, QBrush, QPalette, QPainter
     HAS_PYSIDE6 = True
 except ImportError:
@@ -587,7 +604,8 @@ QMainWindow { background-color: #1e1e2e; }
 QWidget { background-color: #1e1e2e; color: #cdd6f4; font-family: "Microsoft YaHei", sans-serif; font-size: 13px; }
 
 QLabel#title_label { color: #89b4fa; font-size: 16px; font-weight: bold; padding: 8px; }
-QLabel#section_label { color: #a6adc8; font-size: 13px; font-weight: bold; padding: 4px 8px 2px; border-bottom: 1px solid #45475a; margin-top: 4px; }
+QLabel#section_label { color: #a6adc8; font-size: 14px; font-weight: bold; padding: 4px 8px 2px; border-bottom: 1px solid #45475a; margin-top: 4px; }
+QLabel#dim_title { color: #cba6f7; font-size: 18px; font-weight: bold; padding: 8px 12px; }
 
 QTableWidget {
     background-color: #181825;
@@ -614,6 +632,7 @@ QPushButton#btn_primary {
     padding: 6px 16px; font-weight: bold; min-height: 28px;
 }
 QPushButton#btn_primary:hover { background-color: #74c7ec; }
+QPushButton#btn_primary:checked, QPushButton#btn_primary:pressed { background-color: #b4befe; }
 QPushButton#btn_success {
     background-color: #a6e3a1; color: #1e1e2e; border: none; border-radius: 4px;
     padding: 6px 16px; font-weight: bold; min-height: 28px;
@@ -635,6 +654,16 @@ QPushButton#btn_default {
 }
 QPushButton#btn_default:hover { background-color: #585b70; }
 
+/* 渠道按钮样式 */
+QPushButton#ch_btn {
+    background-color: #313244; color: #cdd6f4; border: 1px solid #585b70; border-radius: 4px;
+    padding: 6px 18px; font-weight: normal; min-height: 28px;
+}
+QPushButton#ch_btn:hover { background-color: #45475a; border-color: #89b4fa; }
+QPushButton#ch_btn:checked {
+    background-color: #89b4fa; color: #1e1e2e; border-color: #89b4fa; font-weight: bold;
+}
+
 QComboBox {
     background-color: #181825; color: #cdd6f4; border: 1px solid #585b70;
     border-radius: 4px; padding: 4px 8px; min-height: 26px;
@@ -643,6 +672,7 @@ QComboBox::drop-down { border: none; width: 20px; }
 QComboBox::down-arrow { image: none; border-left: 5px solid transparent; border-right: 5px solid transparent; border-top: 6px solid #a6adc8; margin-right: 6px; }
 QComboBox QAbstractItemView { background-color: #181825; color: #cdd6f4; selection-background-color: #45475a; }
 QComboBox:focus { border-color: #89b4fa; }
+QComboBox QAbstractItemView { max-height: 200px; }
 
 QLineEdit {
     background-color: #181825; color: #cdd6f4; border: 1px solid #585b70;
@@ -650,12 +680,14 @@ QLineEdit {
 }
 QLineEdit:focus { border-color: #89b4fa; }
 
+/* 左侧导航栏 */
+QWidget#nav_panel { background-color: #181825; border-right: 1px solid #313244; }
 QListWidget#nav_list {
     background-color: transparent; border: none; outline: none; font-size: 13px;
 }
-QListWidget#nav_list::item { padding: 10px 14px; border-radius: 4px; color: #a6adc8; margin: 1px 4px; }
+QListWidget#nav_list::item { padding: 10px 14px; border-radius: 6px; color: #a6adc8; margin: 2px 6px; }
 QListWidget#nav_list::item:hover { background-color: #313244; color: #cdd6f4; }
-QListWidget#nav_list::item:selected { background-color: #585b70; color: #89b4fa; font-weight: bold; }
+QListWidget#nav_list::item:selected { background-color: #45475a; color: #89b4fa; font-weight: bold; border-left: 3px solid #89b4fa; }
 
 QStatusBar { color: #6c7086; font-size: 11px; }
 QProgressBar { border: 1px solid #45475a; border-radius: 3px; text-align: center; background-color: #181825; color: #a6adc8; height: 18px;}
@@ -666,13 +698,18 @@ QGroupBox {
     font-weight: bold; color: #a6adc8;
 }
 QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }
+
+QSpinBox {
+    background-color: #181825; color: #cdd6f4; border: 1px solid #585b70;
+    border-radius: 4px; padding: 2px 6px; min-height: 24px;
+}
 """
 
 # ============================================================
-#  加载动画遮罩层
+#  加载动画遮罩层（带预计时间）
 # ============================================================
 class LoadingOverlay(QWidget):
-    """半透明加载遮罩，带旋转动画和文字提示"""
+    """半透明加载遮罩，带旋转动画、文字提示和预计耗时"""
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("loading_overlay")
@@ -680,7 +717,7 @@ class LoadingOverlay(QWidget):
         self.setAttribute(Qt.WA_NoSystemBackground, True)
         self.setStyleSheet("""
             QWidget#loading_overlay {
-                background-color: rgba(30, 30, 46, 200);
+                background-color: rgba(30, 30, 46, 220);
                 border-radius: 0px;
             }
             QLabel#loading_text {
@@ -690,7 +727,12 @@ class LoadingOverlay(QWidget):
             }
             QLabel#loading_sub {
                 color: #a6adc8;
-                font-size: 12px;
+                font-size: 13px;
+            }
+            QLabel#time_label {
+                color: #f9e2af;
+                font-size: 14px;
+                font-weight: bold;
             }
         """)
 
@@ -699,7 +741,7 @@ class LoadingOverlay(QWidget):
         layout.setSpacing(16)
 
         # 旋转动画文字
-        self.spinner_label = QLabel("⏳")
+        self.spinner_label = QLabel("\u29d6")  # ⏳
         self.spinner_label.setObjectName("loading_text")
         self.spinner_label.setAlignment(Qt.AlignCenter)
         self.spinner_label.setFixedSize(64, 64)
@@ -717,6 +759,20 @@ class LoadingOverlay(QWidget):
         self.sub_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.sub_label)
 
+        # 预计耗时
+        self.time_label = QLabel("")
+        self.time_label.setObjectName("time_label")
+        self.time_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.time_label)
+
+        # 进度条
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFixedWidth(260)
+        self.progress_bar.setTextVisible(True)
+        layout.addWidget(self.progress_bar)
+
         # 旋转动画
         self._angle = 0
         self._timer = QTimer(self)
@@ -727,7 +783,6 @@ class LoadingOverlay(QWidget):
 
     def _rotate(self):
         self._angle = (self._angle + 12) % 360
-        # 用 ASCII 兼容的旋转字符
         chars = ["|", "/", "-", "\\"]
         idx = (self._angle // 90) % 4
         self.spinner_label.setText(chars[idx])
@@ -735,7 +790,7 @@ class LoadingOverlay(QWidget):
     def _update_text(self):
         self._dots = (self._dots + 1) % 4
         base = self._base_text
-        dots = "．" * self._dots
+        dots = "\uff0e" * self._dots  # ．
         self.text_label.setText(base + dots)
 
     def set_text(self, text: str):
@@ -746,8 +801,20 @@ class LoadingOverlay(QWidget):
     def set_sub_text(self, text: str):
         self.sub_label.setText(text)
 
+    def set_estimated_time(self, seconds: float):
+        """设置预计耗时（秒），自动格式化显示"""
+        if seconds < 60:
+            self.time_label.setText(f"\u23f1 \u9884\u8ba1\u8017\u65f6\uff1a{seconds:.0f} \u79d2")
+        else:
+            mins = int(seconds // 60)
+            secs = int(seconds % 60)
+            self.time_label.setText(f"\u23f1 \u9884\u8ba1\u8017\u65f6\uff1a{mins} \u520d {secs} \u79d2")
+
+    def set_progress(self, value: int):
+        self.progress_bar.setValue(value)
+
     def showEvent(self, event):
-        self._timer.start(60)    # ~16fps 旋转
+        self._timer.start(60)
         self._text_timer.start(400)
         self._base_text = self.text_label.text()
         super().showEvent(event)
@@ -761,6 +828,62 @@ class LoadingOverlay(QWidget):
         if self.parent():
             self.resize(self.parent().size())
         super().resizeEvent(event)
+
+
+# ============================================================
+#  型号输入历史记录管理
+# ============================================================
+class ModelHistoryManager:
+    """管理型号输入历史记录，持久化到 JSON 文件"""
+
+    MAX_HISTORY = 50  # 最大保存条数
+
+    def __init__(self, history_file: str = HISTORY_FILE):
+        self.history_file = history_file
+        self._history = self._load()
+
+    def _load(self) -> List[str]:
+        """从文件加载历史记录"""
+        if os.path.exists(self.history_file):
+            try:
+                with open(self.history_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        return [str(x) for x in data if x]
+            except (json.JSONDecodeError, IOError):
+                pass
+        return []
+
+    def _save(self):
+        """保存到文件"""
+        try:
+            with open(self.history_file, 'w', encoding='utf-8') as f:
+                json.dump(self._history, f, ensure_ascii=False, indent=2)
+        except IOError:
+            pass
+
+    def add(self, text: str):
+        """添加一条新记录（去重，最新的排最前）"""
+        text = text.strip()
+        if not text:
+            return
+        if text in self._history:
+            self._history.remove(text)
+        self._history.insert(0, text)
+        # 限制最大数量
+        self._history = self._history[:self.MAX_HISTORY]
+        self._save()
+
+    def get_all(self) -> List[str]:
+        """获取所有历史记录"""
+        return list(self._history)
+
+    def search(self, prefix: str) -> List[str]:
+        """按前缀搜索匹配的历史记录"""
+        prefix = prefix.lower().strip()
+        if not prefix:
+            return self.get_all()[:20]
+        return [h for h in self._history if prefix in h.lower()][:20]
 
 
 # ============================================================
@@ -789,18 +912,20 @@ class ForecastWorker(QThread):
     def run(self):
         try:
             self.progress.emit(10, "正在加载数据...")
-            # 在后台线程中加载数据
             df = self.engine.load_data()
             if df is None or df.empty:
                 self.error.emit("没有可用的动销数据")
                 return
 
-            # 先快速统计分组数，给用户预期
             dim_info = self.engine.DIMENSIONS.get(self.dimension, self.engine.DIMENSIONS['model'])
             groupby_cols = dim_info['groupby']
             temp_df = df.copy()
-            if self.ch and self.ch != '全部':
-                temp_df = temp_df[temp_df['channel'] == self.ch]
+            if self.ch:
+                if self.ch == '线上':
+                    temp_df = temp_df[temp_df['channel'] == '线上']
+                elif self.ch == '线下':
+                    temp_df = temp_df[temp_df['channel'] == '线下']
+
             if self.cat and self.cat != '全部':
                 temp_df = temp_df[temp_df['category'] == self.cat]
             if self.subcat and self.subcat not in ('全部', None, ''):
@@ -815,7 +940,6 @@ class ForecastWorker(QThread):
             self.progress.emit(30,
                 f"数据加载完成 | 维度: {dim_label} | 待预测: {n_active} 组 | 开始预测...")
 
-            # 运行预测（这个最耗时）
             result_df = self.engine.run_forecast(
                 dimension=self.dimension,
                 forecast_months=self.months,
@@ -829,7 +953,7 @@ class ForecastWorker(QThread):
                 return
 
             n_results = max(0, len(result_df) - 1) if result_df is not None else 0
-            self.progress.emit(90, f"预测完成！共生成 {n_results} 条预测记录，正在更新界面...")
+            self.progress.emit(95, f"预测完成！共生成 {n_results} 条预测记录，正在更新界面...")
             self.finished.emit(result_df)
 
         except Exception as e:
@@ -838,9 +962,12 @@ class ForecastWorker(QThread):
 
 
 class SalesForecastWindow(QMainWindow):
-    """动销预测主窗口"""
+    """动销预测主窗口 v2"""
 
     status_message = Signal(str)
+
+    # 渠道按钮选项
+    CHANNEL_OPTIONS = ['线上和线下', '线上', '线下']
 
     def __init__(self, db_path: str):
         super().__init__()
@@ -849,13 +976,17 @@ class SalesForecastWindow(QMainWindow):
         self.engine = ForecastEngine(self.data_loader)
         self.current_result_df = None
         self.dimensions_data = {}
-        self.worker = None       # 后台线程引用
+        self.worker = None
+        self.model_history = ModelHistoryManager()
+        # 当前选中的维度key
+        self.current_dimension = 'model'
+        # 当前选中的渠道
+        self.current_channel = None  # None 表示"线上和线下"
         self.setWindowTitle("动销预测系统 — DYZG OMS")
         self.setMinimumSize(1200, 750)
-        self.resize(1350, 800)
+        self.resize(1400, 850)
         self.setStyleSheet(TABLE_STYLESHEET)
 
-        # 初始化UI
         self._setup_ui()
         self._load_initial_data()
 
@@ -867,33 +998,35 @@ class SalesForecastWindow(QMainWindow):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        # ===== 左侧导航栏 =====
+        # ===== 左侧导航栏（含预测维度） =====
         nav_panel = QWidget()
-        nav_panel.setMaximumWidth(200)
-        nav_panel.setMinimumWidth(160)
+        nav_panel.setObjectName("nav_panel")
+        nav_panel.setMaximumWidth(220)
+        nav_panel.setMinimumWidth(180)
         nav_layout = QVBoxLayout(nav_panel)
-        nav_layout.setContentsMargins(4, 8, 4, 8)
-        nav_layout.setSpacing(2)
+        nav_layout.setContentsMargins(6, 12, 6, 12)
+        nav_layout.setSpacing(4)
 
-        title = QLabel("📊 销售管理")
+        title = QLabel("\U0001f4ca \u9500\u552e\u7ba1\u7406")
         title.setObjectName("title_label")
         title.setAlignment(Qt.AlignCenter)
         nav_layout.addWidget(title)
 
+        # 导航列表（包含维度选择）
         self.nav_list = QListWidget()
         self.nav_list.setObjectName("nav_list")
         nav_items = [
-            ("🏠 首页", "home"),
-            ("📈 渠道型号动销预测报表", "model"),
-            ("📊 渠道细分类动销预测报表", "subcategory"),
-            ("📋 渠道大类动销预测报表", "category"),
+            ("\U0001f3e0 \u9996\u9875", "home"),
+            ("\U0001f4c8 \u6e20\u9053\u578b\u53f7\u52a8\u9500\u9884\u6d4a\u62a5\u8868", "model"),
+            ("\U0001f4ca \u6e20\u9053\u7ec6\u5206\u7c7b\u52a8\u9500\u9884\u6d4a\u62a5\u8868", "subcategory"),
+            ("\U0001f4cb \u6e20\u9053\u5927\u7c7b\u52a8\u9500\u9884\u6d4a\u62a5\u8868", "category"),
         ]
         for label, key in nav_items:
             item_text = f"  {label}"
             item = QListWidgetItem(item_text)
             item.setData(Qt.UserRole, key)
             self.nav_list.addItem(item)
-        self.nav_list.setCurrentRow(1)
+        self.nav_list.setCurrentRow(1)  # 默认选中"渠道型号"
         self.nav_list.itemClicked.connect(self._on_nav_clicked)
         nav_layout.addWidget(self.nav_list)
 
@@ -906,87 +1039,137 @@ class SalesForecastWindow(QMainWindow):
         # ===== 右侧内容区 =====
         content = QWidget()
         content_layout = QVBoxLayout(content)
-        content_layout.setContentsMargins(12, 8, 12, 8)
-        content_layout.setSpacing(8)
+        content_layout.setContentsMargins(16, 12, 16, 12)
+        content_layout.setSpacing(10)
 
-        # --- 顶部标题 ---
-        header = QLabel("🔮 动销预测率")
-        header.setObjectName("section_label")
-        content_layout.addWidget(header)
+        # --- 顶部标题区（动态显示当前维度） ---
+        header_layout = QHBoxLayout()
+        self.dim_title = QLabel("\U0001f52e \u52a8\u9500\u9884\u6d4a\u7387 \u2014 \u6e20\u9053\u578b\u53f7")
+        self.dim_title.setObjectName("dim_title")
+        header_layout.addWidget(self.dim_title)
+        header_layout.addStretch()
+        content_layout.addLayout(header_layout)
 
         # --- 筛选区 ---
-        filter_box = QGroupBox("筛选条件")
+        filter_box = QGroupBox("\u7b5b\u9009\u6761\u4ef6")
         filter_layout = QGridLayout(filter_box)
+        filter_layout.setSpacing(10)
 
-        # 第一行：维度选择 + 渠道 + 品类
-        filter_layout.addWidget(QLabel("预测维度:"), 0, 0)
-        self.combo_dimension = QComboBox()
-        self.combo_dimension.addItems(["渠道型号", "渠道细分类", "渠道大类"])
-        self.combo_dimension.setCurrentIndex(0)
-        self.combo_dimension.currentIndexChanged.connect(self._on_dimension_changed)
-        filter_layout.addWidget(self.combo_dimension, 0, 1)
+        # 第一行：渠道（三个按钮） + 品类
+        filter_layout.addWidget(QLabel("\u6e20\u9053:"), 0, 0)
 
-        filter_layout.addWidget(QLabel("渠道:"), 0, 2)
-        self.combo_channel = QComboBox()
-        self.combo_channel.setMinimumWidth(100)
-        filter_layout.addWidget(self.combo_channel, 0, 3)
+        # 渠道按钮组（替换原来的下拉框）
+        self.channel_btn_group = {}
+        ch_btn_layout = QHBoxLayout()
+        ch_btn_layout.setSpacing(8)
+        for i, ch_option in enumerate(self.CHANNEL_OPTIONS):
+            btn = QPushButton(ch_option)
+            btn.setObjectName("ch_btn")
+            btn.setCheckable(True)
+            # 默认选中"线上和线下"
+            if i == 0:
+                btn.setChecked(True)
+            btn.clicked.connect(lambda checked, opt=ch_option: self._on_channel_button_clicked(opt))
+            self.channel_btn_group[ch_option] = btn
+            ch_btn_layout.addWidget(btn)
+        filter_layout.addLayout(ch_btn_layout, 0, 1, 1, 2)
 
-        filter_layout.addWidget(QLabel("品类:"), 0, 4)
+        filter_layout.addWidget(QLabel("\u54c1\u7c7b:"), 0, 3)
         self.combo_category = QComboBox()
-        self.combo_category.setMinimumWidth(100)
-        filter_layout.addWidget(self.combo_category, 0, 5)
+        self.combo_category.setMinimumWidth(120)
+        filter_layout.addWidget(self.combo_category, 0, 4)
 
-        # 第二行：细分类 + 型号 + 预测月数
-        filter_layout.addWidget(QLabel("细分类:"), 1, 0)
+        # 第二行：细分类 + 型号（可编辑下拉+历史）
+        filter_layout.addWidget(QLabel("\u7ec6\u5206\u7c7b:"), 1, 0)
         self.combo_subcategory = QComboBox()
-        self.combo_subcategory.setMinimumWidth(120)
+        self.combo_subcategory.setMinimumWidth(130)
         filter_layout.addWidget(self.combo_subcategory, 1, 1)
 
-        filter_layout.addWidget(QLabel("型号:"), 1, 2)
-        self.input_model = QLineEdit()
-        self.input_model.setPlaceholderText("输入型号关键词筛选")
-        self.input_model.setMinimumWidth(140)
-        filter_layout.addWidget(self.input_model, 1, 3)
+        filter_layout.addWidget(QLabel("\u578b\u53f7:"), 1, 2)
+        # 型号：使用可编辑的 QComboBox（支持输入 + 下拉选择 + 历史记录）
+        self.combo_model = QComboBox()
+        self.combo_model.setEditable(True)
+        self.combo_model.setPlaceholderText("\u8f93\u5165/\u9009\u62e9\u578b\u53f7\u5173\u952e\u8bcd...")
+        self.combo_model.setMinimumWidth(180)
+        self.combo_model.lineEdit().returnPressed.connect(self._on_model_enter_pressed)
+        self.combo_model.currentTextChanged.connect(self._on_model_text_changed)
+        # 自动补全
+        self.combo_model.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)  # 不自动插入非列表项
+        model_completer = self.combo_model.completer()
+        if model_completer:
+            model_completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+            model_completer.setFilterMode(Qt.MatchFlag.Contains)
+            model_completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        filter_layout.addWidget(self.combo_model, 1, 3, 1, 2)
 
-        filter_layout.addWidget(QLabel("预测月数:"), 1, 4)
-        self.spin_months = QSpinBox()
-        self.spin_months.setRange(1, 36)
-        self.spin_months.setValue(5)
-        self.spin_months.setMinimumWidth(60)
-        filter_layout.addWidget(self.spin_months, 1, 5)
+        # 第三行：预计月份（起始月 + 结束月）
+        filter_layout.addWidget(QLabel("\u9884\u8ba1\u6708\u4efd:"), 2, 0)
 
-        # 第三行：按钮组
+        month_widget = QWidget()
+        month_layout = QHBoxLayout(month_widget)
+        month_layout.setContentsMargins(0, 0, 0, 0)
+        month_layout.setSpacing(6)
+
+        month_layout.addWidget(QLabel("\u8d77\u59cb"))
+        self.spin_month_start = QSpinBox()
+        self.spin_month_start.setRange(1, 36)
+        self.spin_month_start.setValue(1)
+        self.spin_month_start.setSuffix(" \u4e2a\u6708")
+        self.spin_month_start.setMinimumWidth(90)
+        month_layout.addWidget(self.spin_month_start)
+
+        month_layout.addWidget(QLabel("\u7ed3\u675f"))
+        self.spin_month_end = QSpinBox()
+        self.spin_month_end.setRange(1, 36)
+        self.spin_month_end.setValue(5)
+        self.spin_month_end.setSuffix(" \u4e2a\u6708")
+        self.spin_month_end.setMinimumWidth(90)
+        month_layout.addWidget(self.spin_month_end)
+
+        # 起止联动约束
+        self.spin_month_start.valueChanged.connect(self._on_month_start_changed)
+        self.spin_month_end.valueChanged.connect(self._on_month_end_changed)
+
+        filter_layout.addWidget(month_widget, 2, 1, 1, 2)
+
+        # 快捷预设按钮
+        preset_layout = QHBoxLayout()
+        preset_layout.setSpacing(6)
+        for m in [1, 3, 6, 12]:
+            btn = QPushButton(f"{m}\u4e2a\u6708")
+            btn.setObjectName("btn_default")
+            btn.setFixedSize(56, 26)
+            btn.clicked.connect(lambda checked, v=m: self._set_month_preset(v))
+            preset_layout.addWidget(btn)
+        filter_layout.addLayout(preset_layout, 2, 3, 1, 2)
+
+        # 第四行：操作按钮组
         btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(10)
 
-        self.btn_search = QPushButton("搜索")
+        self.btn_search = QPushButton("\u641c\u7d22")
         self.btn_search.setObjectName("btn_primary")
         self.btn_search.clicked.connect(self._on_search)
         btn_layout.addWidget(self.btn_search)
 
-        self.btn_reset = QPushButton("重置")
+        self.btn_reset = QPushButton("\u91cd\u7f6e")
         self.btn_reset.setObjectName("btn_default")
         self.btn_reset.clicked.connect(self._on_reset)
         btn_layout.addWidget(self.btn_reset)
 
-        self.btn_export = QPushButton("导出")
+        self.btn_export = QPushButton("\u5bfc\u51fa")
         self.btn_export.setObjectName("btn_success")
         self.btn_export.clicked.connect(self._on_export)
         btn_layout.addWidget(self.btn_export)
 
-        self.btn_refresh = QPushButton("刷新数据")
+        self.btn_refresh = QPushButton("\u5237\u65b0\u6570\u636e")
         self.btn_refresh.setObjectName("btn_warning")
         self.btn_refresh.clicked.connect(self._on_refresh)
         btn_layout.addWidget(self.btn_refresh)
 
-        filter_layout.addLayout(btn_layout, 2, 0, 1, 6)
+        filter_layout.addLayout(btn_layout, 3, 0, 1, 5)
 
         content_layout.addWidget(filter_box)
-
-        # --- 进度条 ---
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
-        self.progress_bar.setRange(0, 100)
-        content_layout.addWidget(self.progress_bar)
 
         # --- 结果表格 ---
         self.table = QTableWidget()
@@ -998,7 +1181,7 @@ class SalesForecastWindow(QMainWindow):
         content_layout.addWidget(self.table, stretch=1)
 
         # --- 底部状态栏 ---
-        self.statusBar().showMessage("就绪 — 请点击「搜索」开始预测")
+        self.statusBar().showMessage("\u5c31\u7eea \u2014 \u8bf7\u70b9\u51fb\u300c\u641c\u7d22\u300d\u5f00\u59cb\u9884\u6d4a")
 
         main_layout.addWidget(content, stretch=1)
 
@@ -1008,75 +1191,183 @@ class SalesForecastWindow(QMainWindow):
 
     # ========== 初始数据加载 ==========
     def _load_initial_data(self):
-        """初始化时加载维度数据填充下拉框"""
-        self.statusBar().showMessage("正在加载数据...")
+        """初始化时加载数据填充下拉框和型号列表"""
+        self.statusBar().showMessage("\u6b63\u5728\u52a0\u8f7d\u6570\u636e...")
         QApplication.processEvents()
 
         try:
             self.dimensions_data = self.data_loader.get_dimensions()
-            channels = self.dimensions_data.get('channels', [])
             categories = self.dimensions_data.get('categories', [])
             subcategories = self.dimensions_data.get('subcategories', [])
+            models = self.dimensions_data.get('models', [])
 
-            self.combo_channel.clear()
-            self.combo_channel.addItem('全部')
-            self.combo_channel.addItems(channels)
-
+            # 品类
             self.combo_category.clear()
-            self.combo_category.addItem('全部')
+            self.combo_category.addItem('\u5168\u90e8')
             self.combo_category.addItems(categories)
 
+            # 细分类
             self.combo_subcategory.clear()
-            self.combo_subcategory.addItem('全部')
+            self.combo_subcategory.addItem('\u5168\u90e8')
             self.combo_subcategory.addItems(subcategories)
 
-            self.statusBar().showMessage(f"数据加载完成 | 账期范围: {self.dimensions_data['periods'][0]} ~ {self.dimensions_data['periods'][-1]}")
+            # 型号（填入下拉列表 + 历史记录）
+            self._populate_model_combo(models)
+
+            period_list = self.dimensions_data.get('periods', [])
+            if period_list:
+                self.statusBar().showMessage(
+                    f"\u6570\u636e\u52a0\u8f7e\u5b8c\u6210 | \u8d26\u671f\u8303\u56f4: {period_list[0]} ~ {period_list[-1]}"
+                )
         except Exception as e:
-            self.statusBar().showMessage(f"数据加载失败: {e}")
-            QMessageBox.critical(self, "错误", f"无法加载数据库:\n{e}")
+            self.statusBar().showMessage(f"\u6570\u636e\u52a0\u8f7d\u5931\u8d25: {e}")
+            QMessageBox.critical(self, "\u9519\u8bef", f"\u65e0\u6cd5\u52a0\u8f7d\u6570\u636e\u5e93:\n{e}")
 
-    def _get_current_dimension_key(self) -> str:
-        idx = self.combo_dimension.currentIndex()
-        mapping = {0: 'model', 1: 'subcategory', 2: 'category'}
-        return mapping.get(idx, 'model')
+    def _populate_model_combo(self, db_models: List[str]):
+        """填充型号下拉框：数据库选项 + 历史记录"""
+        self.combo_model.clear()
+        self.combo_model.setPlaceholderText("\u8f93\u5165/\u9009\u62e9\u578b\u53f7...")
 
+        # 先加入历史记录（标记为历史）
+        history = self.model_history.get_all()
+        history_set = set(history)
+
+        # 加入数据库中的型号（排除已在历史中的避免重复）
+        added = set()
+        for h in history:
+            self.combo_model.addItem(h)
+            added.add(h)
+
+        for m in db_models:
+            if m not in added:
+                self.combo_model.addItem(m)
+                added.add(m)
+
+    # ========== 导航/维度切换 ==========
     def _on_nav_clicked(self, item):
+        """左侧导航点击事件 —— 切换预测维度"""
         dim_key = item.data(Qt.UserRole)
+        if dim_key == 'home':
+            # 首页暂不实现具体功能，仅清空表格
+            self.table.setColumnCount(0)
+            self.table.setRowCount(0)
+            self.current_dimension = None
+            self.dim_title.setText("\U0001f3e0 \u9996\u9875")
+            return
+
         if dim_key in ('model', 'subcategory', 'category'):
-            mapping = {'model': 0, 'subcategory': 1, 'category': 2}
-            self.combo_dimension.setCurrentIndex(mapping[dim_key])
-        elif dim_key == 'home':
-            pass  # 可扩展首页仪表盘
+            self.current_dimension = dim_key
+            dim_info = self.engine.DIMENSIONS[dim_key]
+            label = dim_info['label']
 
-    def _on_dimension_changed(self, index):
-        pass  # 维度变化在搜索时处理即可
+            # 更新标题
+            self.dim_title.setText(f"\U0001f52e \u52a8\u9500\u9884\u6d4a\u7387 \u2014 {label}")
 
+            # 高亮左侧导航当前项
+            # （QListWidget 已自动处理 selected 状态）
+
+            self.statusBar().showMessage(f"\u5df2\u5207\u6362\u81f3: {label} \u7ef4\u5ea6")
+
+    # ========== 渠道按钮 ==========
+    def _on_channel_button_clicked(self, option: str):
+        """渠道按钮点击"""
+        # 取消其他按钮的选中状态
+        for opt, btn in self.channel_btn_group.items():
+            if opt != option:
+                btn.setChecked(False)
+        # 当前选中的按钮保持选中
+        self.channel_btn_group[option].setChecked(True)
+        self.current_channel = option if option != '\u7ebf\u4e0a\u548c\u7ebf\u4e0b' else None
+
+    def _get_selected_channel(self) -> Optional[str]:
+        """获取当前选中的渠道值"""
+        for opt, btn in self.channel_btn_group.items():
+            if btn.isChecked():
+                if opt == '\u7ebf\u4e0a\u548c\u7ebf\u4e0b':
+                    return None  # 不过滤
+                return opt
+        return None
+
+    # ========== 型号输入处理 ==========
+    def _on_model_enter_pressed(self):
+        """回车键提交型号时保存到历史记录"""
+        text = self.combo_model.currentText().strip()
+        if text:
+            self.model_history.add(text)
+            # 更新下拉列表（将新输入放到最前面）
+            models = self.dimensions_data.get('models', [])
+            self._populate_model_combo(models)
+
+    def _on_model_text_changed(self, text: str):
+        """型号文本变化时的实时过滤提示（可选增强）"""
+        pass  # QCompleter 已自动处理补全
+
+    # ========== 月份区间处理 ==========
+    def _on_month_start_changed(self, value: int):
+        """起始月份变化时确保不超过结束月份"""
+        if value > self.spin_month_end.value():
+            self.spin_month_end.setValue(value)
+
+    def _on_month_end_changed(self, value: int):
+        """结束月份变化时确保不小于起始月份"""
+        if value < self.spin_month_start.value():
+            self.spin_month_start.setValue(value)
+
+    def _get_forecast_months(self) -> int:
+        """获取实际预测月数（起止差值 + 1）"""
+        start = self.spin_month_start.value()
+        end = self.spin_month_end.value()
+        return end - start + 1
+
+    def _set_month_preset(self, months: int):
+        """快捷预设按钮：如点"3个月"则设为起始1、结束3"""
+        self.spin_month_start.setValue(1)
+        self.spin_month_end.setValue(months)
+
+    # ========== 搜索/预测 ==========
     def _on_search(self):
         """执行搜索和预测（启动后台线程）"""
         if self.worker and self.worker.isRunning():
             self.worker.cancel()
             self.worker.wait(1000)
 
-        dim_key = self._get_current_dimension_key()
-        channel = self.combo_channel.currentText() if self.combo_channel.currentIndex() > 0 else None
+        if not self.current_dimension:
+            QMessageBox.information(self, "\u63d0\u793a", "\u8bf7\u5148\u5728\u5de6\u4fa7\u5bfc\u822a\u680f\u9009\u62e9\u4e00\u4e2a\u9884\u6d4a\u7ef4\u5ea6")
+            return
+
+        channel = self._get_selected_channel()
         category = self.combo_category.currentText() if self.combo_category.currentIndex() > 0 else None
         subcat = self.combo_subcategory.currentText() if self.combo_subcategory.currentIndex() > 0 else None
-        model_kw = self.input_model.text().strip() or None
-        months = self.spin_months.value()
+        model_kw = self.combo_model.currentText().strip() or None
+        months = self._get_forecast_months()
+
+        dim_label = self.engine.DIMENSIONS[self.current_dimension]['label']
+
+        # 计算预计耗时并显示
+        est_time = self.engine.estimate_time(
+            dimension=self.current_dimension,
+            filter_channel=channel,
+            filter_model=model_kw,
+        )
 
         # 显示加载遮罩
-        self.loading_overlay.set_text("正在预测计算")
-        self.loading_overlay.set_sub_text("维度：%s  |  预测月数：%d" % (self.combo_dimension.currentText(), months))
+        self.loading_overlay.set_text("\u6b63\u5728\u9884\u6d4b\u8ba1\u7b97")
+        ch_display = channel if channel else "\u5168\u90e8"
+        self.loading_overlay.set_sub_text(
+            f"\u7ef4\u5ea6: {dim_label}  |  \u9884\u6d4a\u6708\u6570: {months}\u4e2a\u6708  |  \u6e20\u9053: {ch_display}"
+        )
+        self.loading_overlay.set_estimated_time(est_time)
+        self.loading_overlay.set_progress(5)
         self.loading_overlay.show()
         self.loading_overlay.raise_()
 
         self.btn_search.setEnabled(False)
-        self.statusBar().showMessage("正在后台预测，界面可自由操作...")
+        self.statusBar().showMessage("\u6b63\u5728\u540e\u53f0\u9884\u6d4a\uff0c\u754c\u9762\u53ef\u81ea\u7531\u64cd\u4f5c...")
 
         # 启动后台线程
         self.worker = ForecastWorker(
             engine=self.engine,
-            dimension=dim_key,
+            dimension=self.current_dimension,
             months=months,
             ch=channel, cat=category, subcat=subcat, model_kw=model_kw,
         )
@@ -1087,6 +1378,7 @@ class SalesForecastWindow(QMainWindow):
 
     def _on_worker_progress(self, pct: int, text: str):
         self.loading_overlay.set_text(text)
+        self.loading_overlay.set_progress(pct)
         self.statusBar().showMessage(text)
 
     def _on_worker_finished(self, result_df):
@@ -1094,19 +1386,21 @@ class SalesForecastWindow(QMainWindow):
         self._populate_table(result_df)
         self.loading_overlay.hide()
         self.btn_search.setEnabled(True)
+        dim_label = self.engine.DIMENSIONS.get(self.current_dimension, {}).get('label', '')
+        n_records = max(0, len(result_df) - 1) if result_df is not None else 0
         self.statusBar().showMessage(
-            "预测完成 | 共 %d 条记录 | 维度：%s"
-            % (max(0, len(result_df) - 1), self.combo_dimension.currentText())
+            f"\u9884\u6d4a\u5b8c\u6210 | \u5171 {n_records} \u6761\u8bb0\u5f55 | \u7ef4\u5ea6: {dim_label}"
         )
 
     def _on_worker_error(self, msg: str):
         self.loading_overlay.hide()
         self.btn_search.setEnabled(True)
-        self.statusBar().showMessage("预测出错")
-        QMessageBox.warning(self, "警告", msg[:500])
+        self.statusBar().showMessage("\u9884\u6d4a\u51fa\u9519")
+        QMessageBox.warning(self, "\u8b66\u544a", msg[:500])
 
+    # ========== 表格填充 ==========
     def _populate_table(self, df: pd.DataFrame):
-        """将预测结果填充到表格（优化版：批量操作）"""
+        """将预测结果填充到表格"""
         self.table.setUpdatesEnabled(False)
         self.table.setSortingEnabled(False)
 
@@ -1124,13 +1418,10 @@ class SalesForecastWindow(QMainWindow):
         self.table.setHorizontalHeaderLabels(columns)
         self.table.setRowCount(n_rows)
 
-        # 列宽预设
-        col_widths = {'渠道': 55, '型号': 130, '细分类': 90, '预测算法': 65, '准确率': 60}
+        col_widths = {'\u6e20\u9053': 55, '\u578b\u53f7': 130, '\u7ec6\u5206\u7c7b': 90, '\u9884\u6d4b\u7b97\u6cd5': 65, '\u51c6\u786e\u7387': 60}
         for ci, col in enumerate(columns):
             self.table.setColumnWidth(ci, col_widths.get(col, 95))
 
-        # 批量填充
-        is_float = df.apply(lambda col: col.map(lambda x: isinstance(x, (float, np.floating))).any() if col.dtype == 'object' else col.dtype.kind in 'iuf')
         for ri in range(n_rows):
             row = df.iloc[ri]
             for ci, col in enumerate(columns):
@@ -1148,7 +1439,6 @@ class SalesForecastWindow(QMainWindow):
                 item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable)
 
-                # 合计行样式
                 if ri == 0:
                     item.setBackground(QBrush(QColor("#313244")))
                     item.setForeground(QBrush(QColor("#f9e2af")))
@@ -1170,49 +1460,66 @@ class SalesForecastWindow(QMainWindow):
         self.table.setUpdatesEnabled(True)
         self.table.setSortingEnabled(True)
 
+    # ========== 重置 ==========
     def _on_reset(self):
         """重置筛选条件"""
-        self.combo_channel.setCurrentIndex(0)
+        # 重置渠道按钮
+        for opt, btn in self.channel_btn_group.items():
+            if opt == '\u7ebf\u4e0a\u548c\u7ebf\u4e0b':
+                btn.setChecked(True)
+            else:
+                btn.setChecked(False)
+        self.current_channel = None
+
         self.combo_category.setCurrentIndex(0)
         self.combo_subcategory.setCurrentIndex(0)
-        self.input_model.clear()
-        self.spin_months.setValue(5)
+        self.combo_model.setCurrentText('')
+        self.combo_model.lineEdit().setPlaceholderText("\u8f93\u5165/\u9009\u62e9\u578b\u53f7\u5173\u952e\u8bcd...")
+
+        self.spin_month_start.setValue(1)
+        self.spin_month_end.setValue(5)
+
         self.table.setColumnCount(0)
         self.table.setRowCount(0)
         self.current_result_df = None
-        self.statusBar().showMessage("已重置筛选条件")
+        self.statusBar().showMessage("\u5df2\u91cd\u7f6e\u7b5b\u9009\u6761\u4ef6")
 
+    # ========== 导出 ==========
     def _on_export(self):
         """导出为 CSV"""
         if self.current_result_df is None or self.current_result_df.empty:
-            QMessageBox.information(self, "提示", "暂无数据可导出，请先执行搜索。")
+            QMessageBox.information(self, "\u63d0\u793a", "\u6682\u65e0\u6570\u636e\u53ef\u5bfc\u51fa\uff0c\u8bf7\u5148\u6267\u884c\u641c\u7d22\u3002")
             return
 
         path, _ = QFileDialog.getSaveFileName(
-            self, "导出预测结果",
-            f"动销预测_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-            "CSV 文件 (*.csv);;所有文件 (*)",
+            self, "\u5bfc\u51fa\u9884\u6d4b\u7ed3\u679c",
+            f"\u52a8\u9500\u9884\u6d4a_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            "CSV \u6587\u4ef6 (*.csv);;\u6240\u6709\u6587\u4ef6 (*)",
         )
         if not path:
             return
 
         try:
             self.current_result_df.to_csv(path, index=False, encoding='utf-8-sig')
-            self.statusBar().showMessage(f"已导出到: {path}")
-            QMessageBox.information(self, "成功", f"文件已导出到:\n{path}")
+            self.statusBar().showMessage(f"\u5df2\u5bfc\u51fa\u5230: {path}")
+            QMessageBox.information(self, "\u6210\u529f", f"\u6587\u4ef6\u5df2\u5bfc\u51fa\u5230:\n{path}")
         except Exception as e:
-            QMessageBox.critical(self, "导出失败", str(e))
+            QMessageBox.critical(self, "\u5bfc\u51fa\u5931\u8d25", str(e))
 
     def _on_refresh(self):
         """重新加载数据"""
         self._load_initial_data()
-        self.statusBar().showMessage("数据已刷新")
+        self.statusBar().showMessage("\u6570\u636e\u5df2\u5237\u65b0")
 
     def closeEvent(self, event):
         if self.worker and self.worker.isRunning():
             self.worker.cancel()
             self.worker.quit()
             self.worker.wait(3000)
+        # 关闭前保存当前型号输入到历史
+        current_model = self.combo_model.currentText().strip()
+        if current_model:
+            self.model_history.add(current_model)
         self.data_loader.close()
         super().closeEvent(event)
 
@@ -1223,12 +1530,11 @@ class SalesForecastWindow(QMainWindow):
 
 def find_db_path():
     """查找数据库文件"""
-    # 优先级：命令行参数 → 相对路径 → 绝对路径
     if len(sys.argv) > 1 and os.path.exists(sys.argv[1]):
         return sys.argv[1]
 
     candidates = [
-        os.path.join(os.path.dirname(__file__), '..', '任务五', 'oms_sales_data.sqlite'),
+        os.path.join(os.path.dirname(__file__), '..', '\u4efb\u52a1\u4e94', 'oms_sales_data.sqlite'),
         r"C:\Users\cheng\Desktop\作业文件夹\实习\cangku\202321101063\任务五\oms_sales_data.sqlite",
         os.path.join(os.path.dirname(__file__), 'oms_sales_data.sqlite'),
     ]
@@ -1241,18 +1547,47 @@ def find_db_path():
 def main():
     db_path = find_db_path()
     if not db_path:
-        print("[错误] 未找到数据库文件 oms_sales_data.sqlite")
-        print("用法: python sales_forecast.py [数据库路径]")
-        print("      或确保 ../任务五/oms_sales_data.sqlite 存在")
-        input("按回车退出...")
+        print("[\u9519\u8bef] \u672a\u627e\u5230\u6570\u636e\u5e93\u6587\u4ef6 oms_sales_data.sqlite")
+        print("\u7528\u6cd5: python sales_forecast.py [\u6570\u636e\u5e93\u8def\u5f84]")
+        print("      \u6216\u786e\u4fdd ../任务五/oms_sales_data.sqlite \u5b58\u5728")
+        input("\u6309\u56de\u8f66\u9000\u51fa...")
         sys.exit(1)
 
-    print(f"[信息] 使用数据库: {db_path}")
+    print(f"[\u4fe1\u606f] \u4f7f\u7528\u6570\u636e\u5e93: {db_path}")
 
     if not HAS_PYSIDE6:
-        print("[错误] 未安装 PySide6，请运行: pip install PySide6")
-        input("按回车退出...")
+        print("\n" + "=" * 54)
+        print("[提示] 未检测到 PySide6，无法启动图形界面。")
+        print("=" * 54)
+        print()
+        print("  1. 安装 PySide6（需要联网，约 60~100 MB）")
+        print("  2. 退出（直接回车）")
+        print()
+
+        try:
+            choice = input("请选择 (输入 1 或直接回车退出): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n已取消。")
+            sys.exit(1)
+
+        if choice == '1':
+            import subprocess
+            pip_cmd = [sys.executable, "-m", "pip", "install", "PySide6",
+                        "-i", "https://pypi.tuna.tsinghua.edu.cn/simple"]
+            print("\n[信息] 正在安装 PySide6，请稍候...\n")
+            ret = subprocess.run(pip_cmd, check=False)
+            if ret.returncode == 0:
+                print("\n[成功] PySide6 安装完成！请重新运行本程序。")
+            else:
+                print("\n[错误] 安装失败。")
+                print("请在 VS Code 终端手动执行以下命令：")
+                print(f'  "{sys.executable}" -m pip install PySide6')
+        else:
+            print("\n[信息] 已退出。")
+
+        input("\n按回车退出...")
         sys.exit(1)
+
 
     app = QApplication(sys.argv)
     app.setStyle('Fusion')

@@ -1,4 +1,18 @@
-# Database files - too large and contain sensitive data
+# 数据库文件（大文件且含敏感数据，禁止提交到远端仓库）
 *.sqlite
 *.db
 *.sqlite3
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# VS Code
+.vscode/
+
+# 临时文件
+*.log
+*.tmp
+.DS_Store

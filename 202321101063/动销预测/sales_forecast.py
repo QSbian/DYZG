@@ -1028,6 +1028,33 @@ QWidget#content_widget QGroupBox::title { subcontrol-origin: margin; left: 10px;
 QMainWindow::statusBar { background-color: #f8f9fa; border-top: 1px solid #dee2e6; }
 QStatusBar { color: #6c757d; font-size: 11px; background-color: #f8f9fa; }
 QStatusBar::item { border: none; }
+/* ---- 全局 QMessageBox（弹窗） ---- */
+QMessageBox {
+    background-color: #ffffff;
+    color: #333333;
+}
+QMessageBox QLabel {
+    color: #333333;
+    font-size: 13px;
+}
+QMessageBox QPushButton {
+    background-color: #0d6efd;
+    color: #ffffff;
+    border: none;
+    border-radius: 4px;
+    padding: 6px 16px;
+    min-width: 60px;
+    min-height: 26px;
+    font-weight: bold;
+}
+QMessageBox QPushButton:hover {
+    background-color: #0b5ed7;
+}
+QMessageBox QPushButton:pressed {
+    background-color: #0a58ca;
+}
+QMessageBox QDialogButtonBox { background-color: #ffffff; }
+
 QProgressBar { border: 1px solid #ced4da; border-radius: 3px; text-align: center; background-color: #e9ecef; color: #495057; height: 18px; }
 QProgressBar::chunk { background-color: #0d6efd; border-radius: 2px; }
 """

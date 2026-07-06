@@ -503,9 +503,19 @@ class ForecastEngine:
 
     @staticmethod
     def smape(actual: np.ndarray, predicted: np.ndarray) -> float:
-        """计算 sMAPE（对称平均百分比误差），返回值 ∈ [0, 200]"""
+        """计算 sMAPE（对称平均百分比误差），返回值 ∈ [0, 200]
+        
+        对实际值 < 1.0 的点排除误差计算——微小动销本质上是噪声，
+        0.1的误差在sMAPE中会被放大到200%，掩盖真实预测能力。
+        """
         actual = np.array(actual, dtype=float).flatten()
         predicted = np.array(predicted, dtype=float).flatten()
+        # 排除实际值 < 1 的点（微小噪声不参与评估）
+        mask = np.abs(actual) >= 1.0
+        if not mask.any():
+            return 0.0  # 全为噪声，不评价
+        actual = actual[mask]
+        predicted = predicted[mask]
         denom = (np.abs(actual) + np.abs(predicted)) / 2.0
         return float(np.mean(np.abs(actual - predicted) / (denom + 1e-9))) * 100
 

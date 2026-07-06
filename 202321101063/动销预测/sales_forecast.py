@@ -2253,7 +2253,7 @@ class SalesForecastWindow(QMainWindow):
 
         path, _ = QFileDialog.getSaveFileName(
             self, "\u5bfc\u51fa\u9884\u6d4b\u7ed3\u679c",
-            f"\u52a8\u9500\u9884\u6d4a_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            f"\u52a8\u9500\u9884\u6d4b_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
             "CSV \u6587\u4ef6 (*.csv);;\u6240\u6709\u6587\u4ef6 (*)",
         )
         if not path:
